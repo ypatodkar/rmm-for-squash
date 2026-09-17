@@ -1,0 +1,12 @@
+bin/
+obj/
+dist/
+.venv/
+__pycache__/
+*.pyc
+*.user
+.DS_Store
+appsettings.Local.json
+*.db
+*.db-shm
+*.db-wal

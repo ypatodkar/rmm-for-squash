@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SquashRmm.Agent/SquashRmm.Agent.csproj" />
+    <Project Path="src/SquashRmm.Protocol/SquashRmm.Protocol.csproj" />
+  </Folder>
+</Solution>

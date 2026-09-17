@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Squash RMM</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36;
+    --text: #e6e9ef; --muted: #8b93a4; --accent: #5b9dff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 16px; padding: 16px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+  .device {
+    padding: 9px 10px; border-radius: 6px; cursor: pointer; border: 1px solid transparent;
+    display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+  }
+  .device:hover { background: #1e222b; }
+  .device.sel { border-color: var(--accent); background: #1a2333; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.off { background: var(--err); }
+  .dname { font-weight: 500; }
+  .dmeta { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  textarea {
+    width: 100%; min-height: 90px; background: #0c0e12; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    font-family: var(--mono); font-size: 13px; resize: vertical;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; font-weight: 500; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .chip {
+    background: #0c0e12; border: 1px solid var(--border); color: var(--muted);
+    padding: 4px 9px; border-radius: 5px; font-size: 11px; cursor: pointer; font-family: var(--mono);
+  }
+  .chip:hover { color: var(--text); border-color: var(--accent); }
+  pre {
+    background: #0c0e12; border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; overflow: auto; font-family: var(--mono); font-size: 12.5px;
+    margin: 10px 0 0; max-height: 340px; white-space: pre-wrap; word-break: break-word;
+  }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: var(--mono); }
+  .Completed { background: rgba(63,185,80,.15); color: var(--ok); }
+  .TimedOut, .Unreachable, .Failed { background: rgba(248,81,73,.15); color: var(--err); }
+  .Queued, .Dispatched, .Running { background: rgba(210,153,34,.15); color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 6px 8px; border-bottom: 1px solid #1c2029; font-family: var(--mono); }
+  .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Squash RMM</h1>
+  <span class="sub" id="status">connecting…</span>
+  <input id="apikey" type="password" placeholder="X-API-Key" spellcheck="false"
+         style="margin-left:auto;background:#0c0e12;border:1px solid var(--border);
+                border-radius:5px;color:var(--text);padding:5px 9px;font-family:var(--mono);
+                font-size:12px;width:200px">
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Devices</h2>
+    <div id="devices"><div class="empty">No devices enrolled.</div></div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>Run PowerShell</h2>
+      <textarea id="script" placeholder="hostname" spellcheck="false">hostname</textarea>
+      <div class="row">
+        <button id="run" disabled>Run</button>
+        <span class="sub" id="timing"></span>
+      </div>
+      <div class="row">
+        <span class="chip" data-s="hostname">hostname</span>
+        <span class="chip" data-s="Get-Service | Where-Object Status -eq 'Running' | Select-Object -First 5 Name,Status | Format-Table -AutoSize | Out-String">running services</span>
+        <span class="chip" data-s="Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 Name,CPU | Format-Table -AutoSize | Out-String">top cpu</span>
+        <span class="chip" data-s="Get-CimInstance Win32_OperatingSystem | Select-Object LastBootUpTime | Format-List | Out-String">last boot</span>
+        <span class="chip" data-s="Start-Sleep -Seconds 60">force timeout</span>
+      </div>
+      <pre id="output">Select a device, then run a command.</pre>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Recent jobs</h2>
+      <table>
+        <thead><tr><th>State</th><th>Script</th><th>Exit</th><th>Duration</th></tr></thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+let selected = null;
+
+const $ = (id) => document.getElementById(id);
+
+const KEY_STORAGE = "squash.apikey";
+try { $("apikey").value = localStorage.getItem(KEY_STORAGE) || ""; } catch {}
+$("apikey").oninput = () => {
+  try { localStorage.setItem(KEY_STORAGE, $("apikey").value.trim()); } catch {}
+  poll();
+};
+
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), "X-API-Key": $("apikey").value.trim() };
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401) throw new Error("unauthorized — check API key");
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  return res.json();
+}
+
+function renderDevices(list) {
+  const el = $("devices");
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">No devices enrolled.</div>';
+    selected = null; $("run").disabled = true;
+    return;
+  }
+  if (selected && !list.some(d => d.deviceId === selected)) selected = null;
+  if (!selected) selected = (list.find(d => d.online) || list[0]).deviceId;
+
+  el.innerHTML = list.map(d => `
+    <div class="device ${d.deviceId === selected ? "sel" : ""}" data-id="${d.deviceId}">
+      <span class="dot ${d.online ? "on" : "off"}"></span>
+      <span>
+        <div class="dname">${d.hostname}</div>
+        <div class="dmeta">${d.osVersion.slice(0, 28)} · ${d.secondsSinceLastSeen}s</div>
+      </span>
+    </div>`).join("");
+
+  el.querySelectorAll(".device").forEach(node =>
+    node.onclick = () => { selected = node.dataset.id; renderDevices(list); });
+
+  $("run").disabled = !list.find(d => d.deviceId === selected)?.online;
+}
+
+function renderJobs(list) {
+  $("jobs").innerHTML = list.map(j => `
+    <tr>
+      <td><span class="badge ${j.state}">${j.state}</span></td>
+      <td>${(j.script || "").slice(0, 40) || "—"}</td>
+      <td>${j.exitCode ?? "—"}</td>
+      <td>${j.durationMs != null ? j.durationMs + "ms" : "—"}</td>
+    </tr>`).join("") || '<tr><td colspan="4" class="empty">No jobs yet.</td></tr>';
+}
+
+async function poll() {
+  try {
+    const [devices, jobs] = await Promise.all([api("/api/devices"), api("/api/jobs?limit=12")]);
+    renderDevices(devices);
+    renderJobs(jobs);
+    $("status").textContent = `${devices.filter(d => d.online).length} online`;
+  } catch (e) {
+    $("status").textContent = e.message.includes("unauthorized")
+      ? "enter your API key →" : "control plane unreachable";
+  }
+}
+
+$("run").onclick = async () => {
+  const script = $("script").value.trim();
+  if (!script || !selected) return;
+  $("run").disabled = true;
+  $("output").textContent = "running…";
+  $("timing").textContent = "";
+  const t0 = performance.now();
+  try {
+    const { jobId } = await api(`/api/devices/${selected}/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ script, timeoutSeconds: 30 }),
+    });
+    const r = await api(`/api/jobs/${jobId}?waitMs=40000`);
+    const rt = Math.round(performance.now() - t0);
+    $("output").textContent =
+      `state    ${r.state}\nexit     ${r.exitCode ?? "—"}\nexec     ${r.durationMs ?? "—"}ms\n` +
+      `${"─".repeat(46)}\n${r.stdout || ""}${r.stderr ? "\nSTDERR\n" + r.stderr : ""}` +
+      `${r.error ? "\nERROR: " + r.error : ""}`;
+    $("timing").textContent = `round-trip ${rt}ms`;
+  } catch (e) {
+    $("output").textContent = "Error: " + e.message;
+  } finally {
+    $("run").disabled = false;
+    poll();
+  }
+};
+
+document.querySelectorAll(".chip").forEach(c =>
+  c.onclick = () => { $("script").value = c.dataset.s; });
+
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>
