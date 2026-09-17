@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Operator CLI for the Squash RMM control plane.
 #
-#   export SQUASH_SERVER=http://35.173.64.136:5200
+#   export SQUASH_SERVER=https://35-173-64-136.sslip.io
 #   export SQUASH_KEY=$(cat ~/.squash/operator.key)
 #
 #   squashctl devices
@@ -17,8 +17,13 @@ SERVER="${SQUASH_SERVER:-}"
 KEY="${SQUASH_KEY:-}"
 
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-[[ -n $SERVER ]] || die "set SQUASH_SERVER (e.g. http://35.173.64.136:5200)"
+[[ -n $SERVER ]] || die "set SQUASH_SERVER (e.g. https://35-173-64-136.sslip.io)"
 [[ -n $KEY ]] || die "set SQUASH_KEY (your operator API key)"
+
+# The operator key is a fleet-wide credential; never put it on the wire in clear.
+if [[ $SERVER == http://* && ${SQUASH_ALLOW_PLAINTEXT:-0} != 1 ]]; then
+  die "refusing to send the operator key over http. Use https, or set SQUASH_ALLOW_PLAINTEXT=1 for a local test server."
+fi
 
 api() {
   local method=$1 path=$2 body=${3:-}
