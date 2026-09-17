@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import auth
+import protocol
 from jobs import JobStore
 from protocol import JobState, hello_ack, job_dispatch, parse_job_state
 from registry import HEARTBEAT_INTERVAL_SECONDS, DeviceConnection, DeviceRegistry
@@ -25,6 +26,9 @@ TIMEOUT_GRACE_SECONDS = 5.0
 STATIC_DIR = Path(__file__).parent / "static"
 DIST_DIR = Path(os.environ.get("SQUASH_DIST", Path(__file__).parent / "dist"))
 DB_PATH = os.environ.get("SQUASH_DB", str(Path(__file__).parent / "squash.db"))
+# Reject results from agents too old to sign them. Off only while a fleet is
+# mid-upgrade; every such result is audited as unverified.
+REQUIRE_ATTESTATION = os.environ.get("SQUASH_REQUIRE_ATTESTATION", "1") != "0"
 
 store = Store(DB_PATH)
 registry = DeviceRegistry()
@@ -402,6 +406,46 @@ async def agent_connect(websocket: WebSocket) -> None:
         log.info("device %s disconnected", device_id)
 
 
+def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:
+    """A result is accepted only if it describes the script we dispatched and
+    carries a signature from the enrolled device's key. Without this, what a
+    device reports having run is merely an assertion.
+
+    A fleet cannot be upgraded atomically, so an agent predating attestation is
+    tolerated while REQUIRE_ATTESTATION is off -- recorded as unverified rather
+    than silently trusted, so the gap stays visible in the audit trail.
+    """
+    expected_sha = protocol.sha256_hex(job.script)
+    claimed_sha = payload.get("scriptSha256")
+    signature = payload.get("signature")
+
+    if claimed_sha is None and signature is None:
+        if REQUIRE_ATTESTATION:
+            return False, "agent does not attest results; upgrade it"
+        store.audit("system", "job.result_unverified", device_id=device_id,
+                    job_id=job.job_id, detail={"reason": "agent predates attestation"})
+        return True, "unverified (legacy agent)"
+
+    if claimed_sha != expected_sha:
+        return False, f"script hash mismatch (expected {expected_sha[:12]}, got {str(claimed_sha)[:12]})"
+
+    if not signature:
+        return False, "result is not signed"
+
+    device = store.get_device(device_id)
+    if device is None:
+        return False, "device is no longer enrolled"
+
+    attestation = protocol.result_attestation(
+        job.job_id, expected_sha, payload.get("exitCode"),
+        payload.get("durationMs") or 0, payload.get("stdout", ""), payload.get("stderr", ""))
+
+    if not auth.verify_device_payload(device["public_key"], attestation, signature):
+        return False, "signature does not match the enrolled device key"
+
+    return True, "ok"
+
+
 async def _send_loop(websocket: WebSocket, connection: DeviceConnection) -> None:
     while True:
         message = await connection.outbound.get()
@@ -432,9 +476,19 @@ async def _receive_loop(websocket: WebSocket, connection: DeviceConnection) -> N
                 log.warning("device %s returned a result for a job it does not own",
                             connection.device_id)
                 continue
+
+            verified, reason = verify_result(job, payload, connection.device_id)
+            if not verified:
+                jobs.fail(job, JobState.FAILED, f"Result rejected: {reason}")
+                store.audit("system", "job.result_rejected", device_id=connection.device_id,
+                            job_id=job.job_id, detail={"reason": reason})
+                log.error("job %s result rejected: %s", job.job_id, reason)
+                continue
+
             state = parse_job_state(payload.get("state", JobState.COMPLETED.value))
             jobs.complete(job, payload, state)
             store.audit("device", "job.result", device_id=connection.device_id,
                         job_id=job.job_id,
                         detail={"state": state.value, "exitCode": payload.get("exitCode"),
-                                "durationMs": payload.get("durationMs")})
+                                "durationMs": payload.get("durationMs"),
+                                "attested": True})

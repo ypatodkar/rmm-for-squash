@@ -6,6 +6,7 @@ JsonSerializerDefaults.Web. Do not rename without changing the agent.
 
 from __future__ import annotations
 
+import hashlib
 from enum import Enum
 from typing import Any
 
@@ -48,6 +49,25 @@ def parse_job_state(value: Any) -> JobState:
     return JobState(value)
 
 
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def result_attestation(job_id: str, script_sha256: str, exit_code: int | None,
+                       duration_ms: int, stdout: str, stderr: str) -> bytes:
+    """Must match JobResult.Attestation in the agent, byte for byte."""
+    fields = [
+        "squash-rmm-result-v1",
+        job_id,
+        script_sha256,
+        "null" if exit_code is None else str(exit_code),
+        str(duration_ms),
+        sha256_hex(stdout),
+        sha256_hex(stderr),
+    ]
+    return "|".join(fields).encode()
+
+
 def job_dispatch(job_id: str, script: str, timeout_seconds: int, max_output_bytes: int) -> dict:
     return {
         "type": "job_dispatch",
@@ -56,6 +76,7 @@ def job_dispatch(job_id: str, script: str, timeout_seconds: int, max_output_byte
             "script": script,
             "timeoutSeconds": timeout_seconds,
             "maxOutputBytes": max_output_bytes,
+            "scriptSha256": sha256_hex(script),
         },
     }
 

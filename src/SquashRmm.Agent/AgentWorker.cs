@@ -1,5 +1,6 @@
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Text;
 using SquashRmm.Protocol;
 
 namespace SquashRmm.Agent;
@@ -80,7 +81,7 @@ public sealed class AgentWorker(
 
         using var session = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var heartbeat = HeartbeatLoopAsync(socket, ack.HeartbeatIntervalSeconds, session.Token);
-        var receive = ReceiveLoopAsync(socket, session.Token);
+        var receive = ReceiveLoopAsync(socket, credential, session.Token);
 
         try
         {
@@ -106,7 +107,8 @@ public sealed class AgentWorker(
         }
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken ct)
+    private async Task ReceiveLoopAsync(ClientWebSocket socket, DeviceCredential credential,
+        CancellationToken ct)
     {
         while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
         {
@@ -114,18 +116,19 @@ public sealed class AgentWorker(
             if (message is null) break;
 
             if (message is ServerJobDispatch dispatch)
-                _ = RunJobAsync(socket, dispatch.Job, ct);
+                _ = RunJobAsync(socket, dispatch.Job, credential, ct);
         }
     }
 
-    private async Task RunJobAsync(ClientWebSocket socket, JobSpec job, CancellationToken ct)
+    private async Task RunJobAsync(ClientWebSocket socket, JobSpec job,
+        DeviceCredential credential, CancellationToken ct)
     {
         log.LogInformation("Job {JobId} received", job.JobId);
 
         try
         {
             await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentJobAccepted { JobId = job.JobId }, ct);
-            var result = await executor.RunAsync(job, ct);
+            var result = Attest(await executor.RunAsync(job, ct), job, credential);
             await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentJobResult { Result = result }, ct);
             log.LogInformation("Job {JobId} finished: {State} in {Ms}ms", job.JobId, result.State, result.DurationMs);
         }
@@ -133,5 +136,23 @@ public sealed class AgentWorker(
         {
             log.LogError(ex, "Failed to report result for job {JobId}", job.JobId);
         }
+    }
+
+    /// <summary>
+    /// Signs the result so the control plane can confirm it came from this
+    /// device and describes the script that was actually executed.
+    /// </summary>
+    private static JobResult Attest(JobResult result, JobSpec job, DeviceCredential credential)
+    {
+        var scriptSha = result.ScriptSha256 ?? ScriptExecutor.Sha256Hex(job.Script);
+        var attestation = JobResult.Attestation(
+            result.JobId, scriptSha, result.ExitCode, result.DurationMs,
+            ScriptExecutor.Sha256Hex(result.Stdout), ScriptExecutor.Sha256Hex(result.Stderr));
+
+        return result with
+        {
+            ScriptSha256 = scriptSha,
+            Signature = credential.Sign(Encoding.UTF8.GetBytes(attestation)),
+        };
     }
 }

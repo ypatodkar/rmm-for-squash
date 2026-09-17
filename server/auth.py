@@ -53,6 +53,19 @@ def new_challenge() -> str:
     return base64.b64encode(os.urandom(32)).decode()
 
 
+def verify_device_payload(public_key_b64: str, payload: bytes, signature_b64: str) -> bool:
+    """Verifies a device signature over arbitrary bytes (used for result
+    attestations, where the signed data is not a server-issued challenge)."""
+    try:
+        public_key = load_der_public_key(base64.b64decode(public_key_b64))
+        if not isinstance(public_key, ec.EllipticCurvePublicKey):
+            return False
+        public_key.verify(base64.b64decode(signature_b64), payload, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
 def verify_device_signature(public_key_b64: str, challenge_b64: str, signature_b64: str) -> bool:
     """Agent signs the server-issued challenge with its enrolment private key.
     Key is SubjectPublicKeyInfo DER (P-256); signature is DER ECDSA/SHA-256."""

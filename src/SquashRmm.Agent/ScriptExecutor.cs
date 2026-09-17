@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using SquashRmm.Protocol;
 
@@ -80,9 +81,13 @@ public sealed class ScriptExecutor(ILogger<ScriptExecutor> log)
             Stderr = stderr,
             DurationMs = stopwatch.ElapsedMilliseconds,
             StdoutTruncated = stdoutTruncated,
-            StderrTruncated = stderrTruncated
+            StderrTruncated = stderrTruncated,
+            ScriptSha256 = Sha256Hex(job.Script)
         };
     }
+
+    public static string Sha256Hex(string value) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
 
     private static ProcessStartInfo BuildStartInfo(string script)
     {
