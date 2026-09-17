@@ -217,12 +217,15 @@ function renderDevices(list) {
   if (selected && !list.some(d => d.deviceId === selected)) selected = null;
   if (!selected) selected = (list.find(d => d.online) || list[0]).deviceId;
 
+  // hostname and osVersion are endpoint-supplied and therefore untrusted:
+  // a compromised device could otherwise run script in the operator's browser,
+  // where the API key lives.
   el.innerHTML = list.map(d => `
-    <div class="device ${d.deviceId === selected ? "sel" : ""}" data-id="${d.deviceId}">
+    <div class="device ${d.deviceId === selected ? "sel" : ""}" data-id="${escapeHtml(d.deviceId)}">
       <span class="dot ${d.online ? "on" : "off"}"></span>
       <span>
-        <div class="dname">${d.hostname}</div>
-        <div class="dmeta">${d.osVersion.slice(0, 28)} · ${d.secondsSinceLastSeen}s</div>
+        <div class="dname">${escapeHtml(d.hostname)}</div>
+        <div class="dmeta">${escapeHtml(String(d.osVersion ?? "").slice(0, 28))} · ${escapeHtml(d.secondsSinceLastSeen)}s</div>
       </span>
     </div>`).join("");
 

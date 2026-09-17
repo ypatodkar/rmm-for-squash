@@ -189,18 +189,22 @@ async def enroll(request: EnrollRequest) -> dict:
 
     existing = store.get_device(request.device_id)
 
+    hostname = protocol.clean_endpoint_text(request.hostname)
+    os_version = protocol.clean_endpoint_text(request.os_version)
+    agent_version = protocol.clean_endpoint_text(request.agent_version, max_length=32)
+
     if existing is None:
-        store.insert_device(request.device_id, request.public_key, request.hostname,
-                            request.os_version, request.agent_version)
+        store.insert_device(request.device_id, request.public_key, hostname,
+                            os_version, agent_version)
         store.audit("device", "enroll.success", device_id=request.device_id,
-                    detail={"hostname": request.hostname})
-        log.info("device %s (%s) enrolled", request.device_id, request.hostname)
+                    detail={"hostname": hostname})
+        log.info("device %s (%s) enrolled", request.device_id, hostname)
         return {"deviceId": request.device_id,
                 "heartbeatIntervalSeconds": HEARTBEAT_INTERVAL_SECONDS}
 
     if existing["revoked"]:
         store.audit("unknown", "enroll.rejected", device_id=request.device_id,
-                    detail={"reason": "device is revoked", "hostname": request.hostname})
+                    detail={"reason": "device is revoked", "hostname": hostname})
         log.warning("rejected enrolment for revoked device %s", request.device_id)
         raise HTTPException(
             status_code=403,
@@ -209,19 +213,19 @@ async def enroll(request: EnrollRequest) -> dict:
     if not grants.get("allow_rebind"):
         store.audit("unknown", "enroll.rejected", device_id=request.device_id,
                     detail={"reason": "device already enrolled; recovery token required",
-                            "hostname": request.hostname})
+                            "hostname": hostname})
         log.warning("rejected key replacement for enrolled device %s", request.device_id)
         raise HTTPException(
             status_code=409,
             detail="Device is already enrolled. Replacing its key requires a "
                    "recovery token issued for that device.")
 
-    if not store.rebind_device(request.device_id, request.public_key, request.hostname,
-                               request.os_version, request.agent_version):
+    if not store.rebind_device(request.device_id, request.public_key, hostname,
+                               os_version, agent_version):
         raise HTTPException(status_code=409, detail="Device could not be rebound.")
 
     store.audit("device", "enroll.rebind", device_id=request.device_id,
-                detail={"hostname": request.hostname,
+                detail={"hostname": hostname,
                         "previousHostname": existing["hostname"],
                         "authorizedBy": "recovery token"})
     log.warning("device %s key replaced via recovery token", request.device_id)
@@ -255,8 +259,23 @@ async def revoke_device(device_id: str, operator: str = Depends(require_operator
     connection = registry.get(device_id)
     if connection is not None:
         connection.revoked = True
-    store.audit(operator, "device.revoke", device_id=device_id)
-    return {"deviceId": device_id, "revoked": True}
+    # Revocation must take effect now, not at the next reconnect: drop any work
+    # already queued for the device and close the socket it is holding.
+    cancelled = 0
+    for job in list(jobs.active()):
+        if job.device_id == device_id:
+            jobs.fail(job, JobState.UNREACHABLE, "Device was revoked before the job completed.")
+            store.audit(operator, "job.cancelled_by_revoke",
+                        device_id=device_id, job_id=job.job_id)
+            cancelled += 1
+
+    if connection is not None:
+        connection.drain_pending()
+        await connection.close()
+
+    store.audit(operator, "device.revoke", device_id=device_id,
+                detail={"cancelledJobs": cancelled, "hadLiveConnection": connection is not None})
+    return {"deviceId": device_id, "revoked": True, "cancelledJobs": cancelled}
 
 
 @app.post("/api/devices/{device_id}/unrevoke")
@@ -383,9 +402,12 @@ async def agent_connect(websocket: WebSocket) -> None:
     connection = registry.register(
         DeviceConnection(
             device_id=device_id,
-            hostname=hello.get("hostname", device["hostname"]),
-            os_version=hello.get("osVersion", device["os_version"]),
-            agent_version=hello.get("agentVersion", device["agent_version"]),
+            hostname=protocol.clean_endpoint_text(
+                hello.get("hostname"), fallback=device["hostname"]),
+            os_version=protocol.clean_endpoint_text(
+                hello.get("osVersion"), fallback=device["os_version"]),
+            agent_version=protocol.clean_endpoint_text(
+                hello.get("agentVersion"), max_length=32, fallback=device["agent_version"]),
         )
     )
     store.touch_device(device_id)
@@ -396,10 +418,16 @@ async def agent_connect(websocket: WebSocket) -> None:
 
     sender = asyncio.create_task(_send_loop(websocket, connection))
     receiver = asyncio.create_task(_receive_loop(websocket, connection))
+    revoked = asyncio.create_task(connection.closed.wait())
     try:
-        _, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+        _, pending = await asyncio.wait({sender, receiver, revoked},
+                                        return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
+        if revoked.done():
+            log.warning("closing socket for revoked device %s", device_id)
+            with contextlib.suppress(Exception):
+                await websocket.close(code=4403, reason="revoked")
     finally:
         registry.remove(device_id, connection)
         store.audit("device", "disconnect", device_id=device_id)

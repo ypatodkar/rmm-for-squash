@@ -19,8 +19,23 @@ class DeviceConnection:
     connected_at: float = field(default_factory=time.time)
     revoked: bool = False
 
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
+
     def touch(self) -> None:
         self.last_seen = time.monotonic()
+
+    def drain_pending(self) -> int:
+        """Discards work queued but not yet delivered."""
+        dropped = 0
+        while not self.outbound.empty():
+            self.outbound.get_nowait()
+            dropped += 1
+        return dropped
+
+    async def close(self) -> None:
+        """Signals the socket handler to tear the connection down."""
+        self.revoked = True
+        self.closed.set()
 
     @property
     def seconds_since_last_seen(self) -> float:

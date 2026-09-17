@@ -53,6 +53,20 @@ def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+_CONTROL_CHARS = {c: None for c in range(0x20) if c not in (0x09,)}
+
+
+def clean_endpoint_text(value: object, *, max_length: int = 128, fallback: str = "unknown") -> str:
+    """Endpoint-supplied descriptive text (hostname, OS version) is untrusted.
+    Bound it and strip control characters before it is stored or displayed, so
+    a hostile device cannot smuggle markup, terminal escapes or unbounded data
+    into an operator's console."""
+    if not isinstance(value, str):
+        return fallback
+    cleaned = value.translate(_CONTROL_CHARS).strip()
+    return cleaned[:max_length] or fallback
+
+
 def result_attestation(job_id: str, script_sha256: str, exit_code: int | None,
                        duration_ms: int, stdout: str, stderr: str) -> bytes:
     """Must match JobResult.Attestation in the agent, byte for byte."""
