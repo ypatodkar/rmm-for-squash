@@ -20,10 +20,10 @@ public sealed class Enrollment(IConfiguration config, ILogger<Enrollment> log)
         var markerPath = Path.Combine(StateDirectory(), "enrolled");
         if (!keyIsNew && File.Exists(markerPath)) return;
 
-        var token = config["Enrollment:Token"];
+        var token = ReadToken();
         if (string.IsNullOrWhiteSpace(token))
             throw new InvalidOperationException(
-                "No enrolment token configured and this device is not yet enrolled.");
+                "No enrolment token available and this device is not yet enrolled.");
 
         var httpBase = (config["Server:Url"] ?? "").Replace("wss://", "https://").Replace("ws://", "http://");
         using var http = new HttpClient { BaseAddress = new Uri(httpBase.TrimEnd('/') + "/") };
@@ -39,17 +39,46 @@ public sealed class Enrollment(IConfiguration config, ILogger<Enrollment> log)
         }
 
         await File.WriteAllTextAsync(markerPath, DateTimeOffset.UtcNow.ToString("o"), ct);
+        DiscardToken();
         log.LogInformation("Enrolled device {DeviceId}", deviceId);
     }
 
+    private static string TokenPath() => Path.Combine(StateDirectory(), "enroll.token");
+
+    private string? ReadToken()
+    {
+        var path = TokenPath();
+        if (File.Exists(path))
+        {
+            var fromFile = File.ReadAllText(path).Trim();
+            if (fromFile.Length > 0) return fromFile;
+        }
+        return config["Enrollment:Token"];
+    }
+
+    /// <summary>A redeemed token is spent; leaving it on disk serves no purpose.</summary>
+    private void DiscardToken()
+    {
+        try
+        {
+            if (File.Exists(TokenPath())) File.Delete(TokenPath());
+        }
+        catch (IOException ex)
+        {
+            log.LogWarning("Could not remove the spent enrolment token: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// State sits beside the executable so it follows wherever the installer
+    /// places the agent, rather than assuming a fixed path.
+    /// </summary>
     public static string StateDirectory()
     {
         var configured = Environment.GetEnvironmentVariable("SQUASH_STATE_DIR");
         var path = !string.IsNullOrWhiteSpace(configured)
             ? configured
-            : OperatingSystem.IsWindows()
-                ? @"C:\SquashRmm\state"
-                : Path.Combine(Path.GetTempPath(), "squash-agent-state");
+            : Path.Combine(AppContext.BaseDirectory, "state");
         Directory.CreateDirectory(path);
         return path;
     }

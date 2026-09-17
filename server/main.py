@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -23,6 +23,7 @@ log = logging.getLogger("controlplane")
 SUPERVISOR_TICK_SECONDS = 1.0
 TIMEOUT_GRACE_SECONDS = 5.0
 STATIC_DIR = Path(__file__).parent / "static"
+DIST_DIR = Path(os.environ.get("SQUASH_DIST", Path(__file__).parent / "dist"))
 DB_PATH = os.environ.get("SQUASH_DB", str(Path(__file__).parent / "squash.db"))
 
 store = Store(DB_PATH)
@@ -102,33 +103,126 @@ async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+def _dist_file(name: str, media_type: str) -> FileResponse:
+    """Install artifacts are unauthenticated on purpose: they contain no
+    secrets, and an endpoint has no credential until it enrols. Integrity
+    comes from the published SHA-256, which is why this must run over TLS
+    in any real deployment."""
+    path = DIST_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"{name} has not been published.")
+    return FileResponse(path, media_type=media_type, filename=name)
+
+
+@app.get("/download/agent.exe")
+async def download_agent() -> FileResponse:
+    return _dist_file("SquashRmm.Agent.exe", "application/octet-stream")
+
+
+@app.get("/download/agent.sha256")
+async def download_agent_hash() -> FileResponse:
+    return _dist_file("SquashRmm.Agent.exe.sha256", "text/plain")
+
+
+@app.get("/install.ps1")
+async def install_script() -> FileResponse:
+    return _dist_file("install.ps1", "text/plain")
+
+
+@app.get("/uninstall.ps1")
+async def uninstall_script() -> FileResponse:
+    return _dist_file("uninstall.ps1", "text/plain")
+
+
+class TokenRequest(BaseModel):
+    allow_rebind: bool = Field(default=False, alias="allowRebind")
+    device_id: str | None = Field(default=None, alias="deviceId")
+
+    model_config = {"populate_by_name": True}
+
+
 @app.post("/api/enrollment-tokens", status_code=201)
-async def mint_enrollment_token(operator: str = Depends(require_operator)) -> dict:
+async def mint_enrollment_token(request: TokenRequest | None = None,
+                                operator: str = Depends(require_operator)) -> dict:
+    """A default token enrols a new device. `allowRebind` additionally permits
+    replacing an enrolled device's key, and should be pinned to a `deviceId`
+    so that a leak cannot be redirected at another machine."""
+    request = request or TokenRequest()
+    if request.allow_rebind and not request.device_id:
+        raise HTTPException(
+            status_code=400,
+            detail="A recovery token must name the deviceId it may rebind.")
+
     token = auth.new_enrollment_token()
     expires_at = store.create_enrollment_token(
-        auth.hash_token(token), auth.ENROLLMENT_TOKEN_TTL_SECONDS, operator
+        auth.hash_token(token), auth.ENROLLMENT_TOKEN_TTL_SECONDS, operator,
+        allow_rebind=request.allow_rebind, bound_device_id=request.device_id,
     )
-    store.audit(operator, "enrollment_token.create")
+    store.audit(operator, "enrollment_token.create",
+                device_id=request.device_id,
+                detail={"allowRebind": request.allow_rebind})
     return {"token": token, "expiresAt": expires_at,
-            "ttlSeconds": auth.ENROLLMENT_TOKEN_TTL_SECONDS}
+            "ttlSeconds": auth.ENROLLMENT_TOKEN_TTL_SECONDS,
+            "allowRebind": request.allow_rebind, "boundDeviceId": request.device_id}
 
 
 @app.post("/api/enroll", status_code=201)
 async def enroll(request: EnrollRequest) -> dict:
-    """Authenticated by the single-use enrolment token only. Grants no
-    standing access: it registers a key and is immediately burned."""
-    ok, reason = store.redeem_enrollment_token(auth.hash_token(request.token), request.device_id)
+    """Authenticated by the single-use enrolment token only. Grants no standing
+    access: it registers a key and is immediately burned.
+
+    A plain token can only claim a device id that is not yet enrolled. Replacing
+    an enrolled device's key is credential recovery, which needs a token the
+    operator explicitly issued for it -- a matching device id proves nothing,
+    since the id is derived from hardware an attacker may simply assert.
+    """
+    ok, reason, grants = store.redeem_enrollment_token(
+        auth.hash_token(request.token), request.device_id)
     if not ok:
         store.audit("unknown", "enroll.rejected", device_id=request.device_id,
                     detail={"reason": reason})
         raise HTTPException(status_code=403, detail=f"Enrollment refused: {reason}")
 
-    store.upsert_device(request.device_id, request.public_key, request.hostname,
-                        request.os_version, request.agent_version)
-    store.audit("device", "enroll.success", device_id=request.device_id,
-                detail={"hostname": request.hostname})
-    log.info("device %s (%s) enrolled", request.device_id, request.hostname)
-    return {"deviceId": request.device_id, "heartbeatIntervalSeconds": HEARTBEAT_INTERVAL_SECONDS}
+    existing = store.get_device(request.device_id)
+
+    if existing is None:
+        store.insert_device(request.device_id, request.public_key, request.hostname,
+                            request.os_version, request.agent_version)
+        store.audit("device", "enroll.success", device_id=request.device_id,
+                    detail={"hostname": request.hostname})
+        log.info("device %s (%s) enrolled", request.device_id, request.hostname)
+        return {"deviceId": request.device_id,
+                "heartbeatIntervalSeconds": HEARTBEAT_INTERVAL_SECONDS}
+
+    if existing["revoked"]:
+        store.audit("unknown", "enroll.rejected", device_id=request.device_id,
+                    detail={"reason": "device is revoked", "hostname": request.hostname})
+        log.warning("rejected enrolment for revoked device %s", request.device_id)
+        raise HTTPException(
+            status_code=403,
+            detail="Device is revoked. An operator must restore it before it can re-enrol.")
+
+    if not grants.get("allow_rebind"):
+        store.audit("unknown", "enroll.rejected", device_id=request.device_id,
+                    detail={"reason": "device already enrolled; recovery token required",
+                            "hostname": request.hostname})
+        log.warning("rejected key replacement for enrolled device %s", request.device_id)
+        raise HTTPException(
+            status_code=409,
+            detail="Device is already enrolled. Replacing its key requires a "
+                   "recovery token issued for that device.")
+
+    if not store.rebind_device(request.device_id, request.public_key, request.hostname,
+                               request.os_version, request.agent_version):
+        raise HTTPException(status_code=409, detail="Device could not be rebound.")
+
+    store.audit("device", "enroll.rebind", device_id=request.device_id,
+                detail={"hostname": request.hostname,
+                        "previousHostname": existing["hostname"],
+                        "authorizedBy": "recovery token"})
+    log.warning("device %s key replaced via recovery token", request.device_id)
+    return {"deviceId": request.device_id, "rebound": True,
+            "heartbeatIntervalSeconds": HEARTBEAT_INTERVAL_SECONDS}
 
 
 @app.get("/api/devices")
@@ -161,9 +255,34 @@ async def revoke_device(device_id: str, operator: str = Depends(require_operator
     return {"deviceId": device_id, "revoked": True}
 
 
+@app.post("/api/devices/{device_id}/unrevoke")
+async def unrevoke_device(device_id: str, operator: str = Depends(require_operator)) -> dict:
+    """Restoring a revoked device is an explicit operator act, never a
+    side effect of the device re-enrolling."""
+    if not store.unrevoke_device(device_id):
+        raise HTTPException(status_code=404, detail="Unknown device.")
+    connection = registry.get(device_id)
+    if connection is not None:
+        connection.revoked = False
+    store.audit(operator, "device.unrevoke", device_id=device_id)
+    return {"deviceId": device_id, "revoked": False}
+
+
 @app.get("/api/jobs")
-async def list_jobs(limit: int = 50, operator: str = Depends(require_operator)) -> list[dict]:
-    return jobs.recent(limit)
+async def list_jobs(
+    limit: int = Query(default=50, ge=1, le=1000),
+    page: int | None = Query(default=None, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100, alias="pageSize"),
+    state: JobState | None = None,
+    device_id: str | None = Query(default=None, alias="deviceId"),
+    search: str = Query(default="", max_length=500),
+    operator: str = Depends(require_operator),
+) -> dict | list[dict]:
+    # Keep the existing array response for callers using only ?limit=.
+    if page is None and state is None and device_id is None and not search:
+        return jobs.recent(limit)
+    return jobs.page(page or 1, page_size, state=state.value if state else None,
+                     device_id=device_id, search=search)
 
 
 @app.get("/api/audit")

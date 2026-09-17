@@ -22,6 +22,7 @@
   h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
   .sub { color: var(--muted); font-size: 12px; }
   main { display: grid; grid-template-columns: 300px 1fr; gap: 16px; padding: 16px; }
+  main > section { min-width: 0; }
   @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
   .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
@@ -65,6 +66,25 @@
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
   td { padding: 6px 8px; border-bottom: 1px solid #1c2029; font-family: var(--mono); }
+  .jobs-scroll {
+    max-height: 320px; overflow-x: auto; overflow-y: scroll;
+    scrollbar-gutter: stable; scrollbar-color: var(--muted) #0c0e12;
+  }
+  .jobs-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+  .jobs-scroll::-webkit-scrollbar-track { background: #0c0e12; }
+  .jobs-scroll::-webkit-scrollbar-thumb { background: var(--muted); border: 3px solid #0c0e12; border-radius: 6px; }
+  .jobs-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .jobs-scroll th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+  .jobs-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-bottom: 12px; }
+  .jobs-filters label { display: flex; flex: 1 1 140px; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; min-width: 0; }
+  .jobs-filters input, .jobs-filters select {
+    width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--border);
+    border-radius: 5px; background: #0c0e12; color: var(--text); font: inherit;
+  }
+  .jobs-filters :is(input, select):focus-visible { outline: 2px solid var(--accent); }
+  .jobs-pagination { justify-content: space-between; }
+  .jobs-pagination nav { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .jobs-error { color: var(--err); font-size: 12px; }
   .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
 </style>
 </head>
@@ -79,9 +99,25 @@
 </header>
 
 <main>
-  <section class="panel">
-    <h2>Devices</h2>
-    <div id="devices"><div class="empty">No devices enrolled.</div></div>
+  <section>
+    <div class="panel">
+      <h2>Devices</h2>
+      <div id="devices"><div class="empty">No devices enrolled.</div></div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Enroll a device</h2>
+      <select id="enroll-target" style="width:100%;background:#0c0e12;border:1px solid var(--border);
+              border-radius:6px;color:var(--text);padding:7px 9px;font-size:12.5px;margin-bottom:8px">
+        <option value="">New machine (first install)</option>
+      </select>
+      <button id="enroll" style="width:100%">Generate install command</button>
+      <pre id="enrollout" style="display:none;font-size:11.5px;max-height:none"></pre>
+      <div class="row" id="enrollactions" style="display:none">
+        <span class="chip" id="copycmd">copy to clipboard</span>
+        <span class="sub" id="copied"></span>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -103,19 +139,58 @@
     </div>
 
     <div class="panel" style="margin-top:16px">
-      <h2>Recent jobs</h2>
-      <table>
-        <thead><tr><th>State</th><th>Script</th><th>Exit</th><th>Duration</th></tr></thead>
-        <tbody id="jobs"></tbody>
-      </table>
+      <h2 id="recent-jobs-heading">Recent jobs</h2>
+      <p class="sub" id="jobs-scope" style="margin:-6px 0 8px"></p>
+      <div class="jobs-filters">
+        <label for="jobs-state">Status
+          <select id="jobs-state">
+            <option value="">All statuses</option>
+            <option value="Queued">Queued</option>
+            <option value="Dispatched">Dispatched</option>
+            <option value="Running">Running</option>
+            <option value="Completed">Completed</option>
+            <option value="TimedOut">Timed out</option>
+            <option value="Unreachable">Unreachable</option>
+            <option value="Failed">Failed</option>
+          </select>
+        </label>
+        <label for="jobs-search">Script contains
+          <input id="jobs-search" type="search" placeholder="Search scripts…" maxlength="500">
+        </label>
+        <button id="jobs-clear" type="button">Clear filters</button>
+      </div>
+      <p id="jobs-error" class="jobs-error" role="alert" hidden></p>
+      <div id="jobs-scroll" class="jobs-scroll" role="region" aria-labelledby="recent-jobs-heading" tabindex="0">
+        <table>
+          <thead><tr><th>State</th><th>Script</th><th>Exit</th><th>Exec</th><th>Round-trip</th><th>Overhead</th></tr></thead>
+          <tbody id="jobs"></tbody>
+        </table>
+      </div>
+      <div class="row jobs-pagination">
+        <span id="jobs-count" class="sub" aria-live="polite"></span>
+        <nav aria-label="Job history pages">
+          <button id="jobs-prev" type="button" disabled>Previous</button>
+          <span id="jobs-page" class="sub">Page 1 of 1</span>
+          <button id="jobs-next" type="button" disabled>Next</button>
+        </nav>
+      </div>
     </div>
   </section>
 </main>
 
 <script>
 let selected = null;
+const JOBS_PAGE_SIZE = 30;
+let jobsPage = 1;
+let jobsTotalPages = 1;
+let resetJobsScroll = false;
+let searchTimer;
+let deviceNames = new Map();
+let latestPoll = 0;
 
 const $ = (id) => document.getElementById(id);
+const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,
+  char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
 
 const KEY_STORAGE = "squash.apikey";
 try { $("apikey").value = localStorage.getItem(KEY_STORAGE) || ""; } catch {}
@@ -151,33 +226,131 @@ function renderDevices(list) {
       </span>
     </div>`).join("");
 
+  // Selecting a device also scopes the job history to it; two independent
+  // device pickers reads as a bug. "All devices" stays available in the filter.
   el.querySelectorAll(".device").forEach(node =>
-    node.onclick = () => { selected = node.dataset.id; renderDevices(list); });
+    node.onclick = () => {
+      selected = node.dataset.id;
+      renderDevices(list);
+      jobsPage = 1;
+      resetJobsScroll = true;
+      poll();
+    });
 
   $("run").disabled = !list.find(d => d.deviceId === selected)?.online;
 }
 
 function renderJobs(list) {
-  $("jobs").innerHTML = list.map(j => `
+  const scroller = $("jobs-scroll");
+  const scrollTop = resetJobsScroll ? 0 : scroller.scrollTop;
+  const scrollLeft = resetJobsScroll ? 0 : scroller.scrollLeft;
+  $("jobs").innerHTML = list.map(j => {
+    const overhead = (j.roundTripMs != null && j.durationMs != null)
+      ? Math.max(0, j.roundTripMs - j.durationMs) + "ms" : "—";
+    return `
     <tr>
-      <td><span class="badge ${j.state}">${j.state}</span></td>
-      <td>${(j.script || "").slice(0, 40) || "—"}</td>
+      <td><span class="badge ${escapeHtml(j.state)}">${escapeHtml(j.state)}</span></td>
+      <td title="${escapeHtml(j.script)}">${escapeHtml((j.script || "").slice(0, 34)) || "—"}</td>
       <td>${j.exitCode ?? "—"}</td>
       <td>${j.durationMs != null ? j.durationMs + "ms" : "—"}</td>
-    </tr>`).join("") || '<tr><td colspan="4" class="empty">No jobs yet.</td></tr>';
+      <td>${j.roundTripMs != null ? j.roundTripMs + "ms" : "—"}</td>
+      <td style="color:var(--muted)">${overhead}</td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="6" class="empty">No jobs match these filters.</td></tr>';
+  scroller.scrollTop = scrollTop;
+  scroller.scrollLeft = scrollLeft;
+  resetJobsScroll = false;
+}
+
+function renderEnrollTargets(devices) {
+  const select = $("enroll-target");
+  const previous = select.value;
+  const options = '<option value="">New machine (first install)</option>' + devices.map(d =>
+    `<option value="${escapeHtml(d.deviceId)}">Reinstall: ${escapeHtml(d.hostname)}${d.revoked ? " (revoked)" : ""}</option>`
+  ).join("");
+  if (select.innerHTML !== options) {
+    select.innerHTML = options;
+    select.value = previous;
+  }
+}
+
+function renderDeviceFilter(devices) {
+  deviceNames = new Map(devices.map(d => [d.deviceId, d.hostname]));
+}
+
+function updatePagination() {
+  $("jobs-prev").disabled = jobsPage <= 1;
+  $("jobs-next").disabled = jobsPage >= jobsTotalPages;
 }
 
 async function poll() {
+  const requestId = ++latestPoll;
+  const query = new URLSearchParams({ page: jobsPage, pageSize: JOBS_PAGE_SIZE });
+  if ($("jobs-state").value) query.set("state", $("jobs-state").value);
+  if (selected) query.set("deviceId", selected);
+  if ($("jobs-search").value.trim()) query.set("search", $("jobs-search").value.trim());
+  $("jobs-prev").disabled = true;
+  $("jobs-next").disabled = true;
   try {
-    const [devices, jobs] = await Promise.all([api("/api/devices"), api("/api/jobs?limit=12")]);
+    const [devices, jobs] = await Promise.all([
+      api("/api/devices"), api(`/api/jobs?${query}`)
+    ]);
+    if (requestId !== latestPoll) return;
     renderDevices(devices);
-    renderJobs(jobs);
+    renderDeviceFilter(devices);
+    renderEnrollTargets(devices);
+    $("jobs-scope").textContent = selected
+      ? `on ${deviceNames.get(selected) || selected}`
+      : "across all devices";
+    if (jobs.page !== jobsPage) resetJobsScroll = true;
+    jobsPage = jobs.page;
+    jobsTotalPages = jobs.totalPages;
+    renderJobs(jobs.items);
+    const first = jobs.total ? (jobsPage - 1) * JOBS_PAGE_SIZE + 1 : 0;
+    const last = first ? first + jobs.items.length - 1 : 0;
+    $("jobs-count").textContent = `${first}–${last} of ${jobs.total} jobs · 30 per page`;
+    $("jobs-page").textContent = `Page ${jobsPage} of ${jobsTotalPages}`;
+    $("jobs-error").hidden = true;
+    updatePagination();
     $("status").textContent = `${devices.filter(d => d.online).length} online`;
   } catch (e) {
+    if (requestId !== latestPoll) return;
+    $("jobs-error").textContent = `Could not refresh job history: ${e.message}`;
+    $("jobs-error").hidden = false;
     $("status").textContent = e.message.includes("unauthorized")
       ? "enter your API key →" : "control plane unreachable";
   }
 }
+
+$("jobs-prev").onclick = () => {
+  jobsPage = Math.max(1, jobsPage - 1);
+  resetJobsScroll = true;
+  return poll();
+};
+$("jobs-next").onclick = () => {
+  jobsPage = Math.min(jobsTotalPages, jobsPage + 1);
+  resetJobsScroll = true;
+  return poll();
+};
+function applyJobFilters() {
+  clearTimeout(searchTimer);
+  jobsPage = 1;
+  resetJobsScroll = true;
+  return poll();
+}
+$("jobs-state").onchange = applyJobFilters;
+$("jobs-search").oninput = () => {
+  ++latestPoll;
+  jobsPage = 1;
+  resetJobsScroll = true;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(applyJobFilters, 250);
+};
+$("jobs-clear").onclick = () => {
+  $("jobs-state").value = "";
+  $("jobs-search").value = "";
+  return applyJobFilters();
+};
 
 $("run").onclick = async () => {
   const script = $("script").value.trim();
@@ -194,11 +367,17 @@ $("run").onclick = async () => {
     });
     const r = await api(`/api/jobs/${jobId}?waitMs=40000`);
     const rt = Math.round(performance.now() - t0);
+    const overhead = (r.roundTripMs != null && r.durationMs != null)
+      ? Math.max(0, r.roundTripMs - r.durationMs) : null;
     $("output").textContent =
-      `state    ${r.state}\nexit     ${r.exitCode ?? "—"}\nexec     ${r.durationMs ?? "—"}ms\n` +
-      `${"─".repeat(46)}\n${r.stdout || ""}${r.stderr ? "\nSTDERR\n" + r.stderr : ""}` +
+      `state       ${r.state}\n` +
+      `exit        ${r.exitCode ?? "—"}\n` +
+      `exec        ${r.durationMs ?? "—"}ms   (on the endpoint)\n` +
+      `round-trip  ${r.roundTripMs ?? "—"}ms   (server-measured dispatch to result)\n` +
+      `overhead    ${overhead ?? "—"}ms   (everything this system adds)\n` +
+      `${"─".repeat(52)}\n${r.stdout || ""}${r.stderr ? "\nSTDERR\n" + r.stderr : ""}` +
       `${r.error ? "\nERROR: " + r.error : ""}`;
-    $("timing").textContent = `round-trip ${rt}ms`;
+    $("timing").textContent = `${rt}ms as seen from this browser`;
   } catch (e) {
     $("output").textContent = "Error: " + e.message;
   } finally {
@@ -207,8 +386,58 @@ $("run").onclick = async () => {
   }
 };
 
-document.querySelectorAll(".chip").forEach(c =>
+document.querySelectorAll(".chip[data-s]").forEach(c =>
   c.onclick = () => { $("script").value = c.dataset.s; });
+
+let installCommand = "";
+
+$("enroll").onclick = async () => {
+  $("enroll").disabled = true;
+  const target = $("enroll-target").value;
+  try {
+    // A plain token only enrols a machine the control plane has never seen.
+    // Re-installing over an existing device is credential recovery, so it
+    // needs a token pinned to that device id.
+    const body = target
+      ? { allowRebind: true, deviceId: target }
+      : {};
+    const { token, ttlSeconds, allowRebind } = await api("/api/enrollment-tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const origin = window.location.origin;
+    installCommand =
+      `iwr ${origin}/install.ps1 -OutFile i.ps1\n` +
+      `.\\i.ps1 -Server ${origin} -Token ${token}`;
+    const kind = allowRebind
+      ? `RECOVERY token for ${deviceNames.get(target) || target}\n` +
+        `It replaces that machine's key and works on no other device.`
+      : `Enrollment token for a machine that has not enrolled before.`;
+    $("enrollout").style.display = "block";
+    $("enrollout").textContent =
+      `${kind}\n` +
+      `Run as Administrator on the endpoint.\n` +
+      `Single use, expires in ${Math.round(ttlSeconds / 60)} minutes.\n` +
+      `${"─".repeat(46)}\n${installCommand}`;
+    $("enrollactions").style.display = "flex";
+  } catch (e) {
+    $("enrollout").style.display = "block";
+    $("enrollout").textContent = "Error: " + e.message;
+  } finally {
+    $("enroll").disabled = false;
+  }
+};
+
+$("copycmd").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(installCommand);
+    $("copied").textContent = "copied";
+    setTimeout(() => ($("copied").textContent = ""), 2000);
+  } catch {
+    $("copied").textContent = "select the text above and copy manually";
+  }
+};
 
 poll();
 setInterval(poll, 3000);

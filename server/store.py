@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS devices (
     agent_version TEXT,
     enrolled_at   REAL NOT NULL,
     last_seen_at  REAL,
-    revoked       INTEGER NOT NULL DEFAULT 0
+    revoked       INTEGER NOT NULL DEFAULT 0,
+    rebound_at    REAL,
+    rebind_count  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS enrollment_tokens (
@@ -24,7 +26,14 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
     expires_at      REAL NOT NULL,
     used_at         REAL,
     used_by_device  TEXT,
-    created_by      TEXT
+    created_by      TEXT,
+    -- A plain token may only register a device id that does not exist yet.
+    -- Replacing an enrolled device's key is credential recovery and needs a
+    -- token the operator deliberately marked for it.
+    allow_rebind    INTEGER NOT NULL DEFAULT 0,
+    -- Optionally pins the token to one device id, so a leaked recovery token
+    -- cannot be aimed at a different machine.
+    bound_device_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -76,7 +85,26 @@ class Store:
         self._db.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._db.executescript(SCHEMA)
+            self._migrate()
             self._db.commit()
+
+    def _migrate(self) -> None:
+        """Adds columns introduced after a database was first created."""
+        additions = {
+            "enrollment_tokens": [
+                ("allow_rebind", "INTEGER NOT NULL DEFAULT 0"),
+                ("bound_device_id", "TEXT"),
+            ],
+            "devices": [
+                ("rebound_at", "REAL"),
+                ("rebind_count", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        }
+        for table, columns in additions.items():
+            existing = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns:
+                if name not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     # ---------- audit ----------
 
@@ -101,31 +129,38 @@ class Store:
 
     # ---------- enrollment tokens ----------
 
-    def create_enrollment_token(self, token_hash: str, ttl_seconds: int, created_by: str) -> float:
+    def create_enrollment_token(self, token_hash: str, ttl_seconds: int, created_by: str,
+                                *, allow_rebind: bool = False,
+                                bound_device_id: str | None = None) -> float:
         now = time.time()
         expires = now + ttl_seconds
         with self._lock:
             self._db.execute(
-                "INSERT INTO enrollment_tokens (token_hash, created_at, expires_at, created_by)"
-                " VALUES (?,?,?,?)", (token_hash, now, expires, created_by)
+                "INSERT INTO enrollment_tokens (token_hash, created_at, expires_at,"
+                " created_by, allow_rebind, bound_device_id) VALUES (?,?,?,?,?,?)",
+                (token_hash, now, expires, created_by, int(allow_rebind), bound_device_id),
             )
             self._db.commit()
         return expires
 
-    def redeem_enrollment_token(self, token_hash: str, device_id: str) -> tuple[bool, str]:
-        """Single-use redemption. Returns (ok, reason)."""
+    def redeem_enrollment_token(self, token_hash: str, device_id: str) -> tuple[bool, str, dict]:
+        """Single-use redemption. Returns (ok, reason, grants). `grants` carries
+        what this particular token is permitted to do, so the caller can decide
+        between first enrolment and credential recovery."""
         now = time.time()
         with self._lock:
             row = self._db.execute(
-                "SELECT expires_at, used_at FROM enrollment_tokens WHERE token_hash = ?",
-                (token_hash,)
+                "SELECT expires_at, used_at, allow_rebind, bound_device_id"
+                " FROM enrollment_tokens WHERE token_hash = ?", (token_hash,)
             ).fetchone()
             if row is None:
-                return False, "unknown token"
+                return False, "unknown token", {}
             if row["used_at"] is not None:
-                return False, "token already used"
+                return False, "token already used", {}
             if row["expires_at"] < now:
-                return False, "token expired"
+                return False, "token expired", {}
+            if row["bound_device_id"] and row["bound_device_id"] != device_id:
+                return False, "token is bound to a different device", {}
 
             self._db.execute(
                 "UPDATE enrollment_tokens SET used_at = ?, used_by_device = ?"
@@ -133,25 +168,52 @@ class Store:
                 (now, device_id, token_hash),
             )
             self._db.commit()
-        return True, "ok"
+        return True, "ok", {"allow_rebind": bool(row["allow_rebind"]),
+                            "bound_device_id": row["bound_device_id"]}
 
     # ---------- devices ----------
 
-    def upsert_device(self, device_id: str, public_key: str, hostname: str,
-                      os_version: str, agent_version: str) -> None:
-        """Re-enrolment of a known machine updates in place, so identity
-        survives reinstall instead of creating a duplicate."""
+    def insert_device(self, device_id: str, public_key: str, hostname: str,
+                      os_version: str, agent_version: str) -> bool:
+        """First enrolment only. Returns False if the id is already claimed;
+        an existing device's key is never silently replaced."""
         with self._lock:
-            self._db.execute(
-                "INSERT INTO devices (device_id, public_key, hostname, os_version,"
-                " agent_version, enrolled_at, revoked) VALUES (?,?,?,?,?,?,0)"
-                " ON CONFLICT(device_id) DO UPDATE SET"
-                " public_key=excluded.public_key, hostname=excluded.hostname,"
-                " os_version=excluded.os_version, agent_version=excluded.agent_version,"
-                " enrolled_at=excluded.enrolled_at, revoked=0",
-                (device_id, public_key, hostname, os_version, agent_version, time.time()),
+            try:
+                self._db.execute(
+                    "INSERT INTO devices (device_id, public_key, hostname, os_version,"
+                    " agent_version, enrolled_at, revoked) VALUES (?,?,?,?,?,?,0)",
+                    (device_id, public_key, hostname, os_version, agent_version, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            self._db.commit()
+        return True
+
+    def rebind_device(self, device_id: str, public_key: str, hostname: str,
+                      os_version: str, agent_version: str) -> bool:
+        """Credential recovery: replaces an enrolled device's key. Deliberately
+        leaves `revoked` untouched, because re-enrolling must never be a way to
+        undo a revocation."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE devices SET public_key=?, hostname=?, os_version=?,"
+                " agent_version=?, enrolled_at=?, rebound_at=?,"
+                " rebind_count=rebind_count+1"
+                " WHERE device_id=? AND revoked=0",
+                (public_key, hostname, os_version, agent_version,
+                 time.time(), time.time(), device_id),
             )
             self._db.commit()
+        return cur.rowcount > 0
+
+    def unrevoke_device(self, device_id: str) -> bool:
+        """Restoring a revoked device is an explicit operator decision."""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE devices SET revoked = 0 WHERE device_id = ?", (device_id,)
+            )
+            self._db.commit()
+        return cur.rowcount > 0
 
     def get_device(self, device_id: str) -> dict | None:
         with self._lock:
@@ -240,6 +302,32 @@ class Store:
                 "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def page_jobs(self, page: int, page_size: int, *, state: str | None = None,
+                  device_id: str | None = None, search: str = "") -> dict:
+        clauses, params = [], []
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        if device_id:
+            clauses.append("device_id = ?")
+            params.append(device_id)
+        if search.strip():
+            # Literal substring matching: '%' and '_' are not wildcards.
+            clauses.append("instr(lower(script), lower(?)) > 0")
+            params.append(search.strip())
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            total = self._db.execute("SELECT COUNT(*) FROM jobs" + where, params).fetchone()[0]
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = min(max(1, page), total_pages)
+            rows = self._db.execute(
+                "SELECT * FROM jobs" + where +
+                " ORDER BY created_at DESC, job_id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": total, "page": page,
+                "pageSize": page_size, "totalPages": total_pages}
 
     def orphan_active_jobs(self) -> None:
         """Called at startup: a job that was in flight when we died can never

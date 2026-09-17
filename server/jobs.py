@@ -19,6 +19,7 @@ class JobRecord:
     created_by: str
     created_at: float = field(default_factory=time.time)
     dispatched_at: float | None = None
+    completed_at: float | None = None
     state: JobState = JobState.QUEUED
     result: dict | None = None
     completion: asyncio.Future = field(
@@ -36,11 +37,21 @@ class JobRecord:
             "stdout": result.get("stdout", ""),
             "stderr": result.get("stderr", ""),
             "durationMs": result.get("durationMs"),
+            "roundTripMs": round_trip_ms(self.dispatched_at, self.completed_at),
             "stdoutTruncated": bool(result.get("stdoutTruncated")),
             "stderrTruncated": bool(result.get("stderrTruncated")),
             "error": result.get("error"),
             "createdAt": self.created_at,
         }
+
+
+def round_trip_ms(dispatched_at: float | None, completed_at: float | None) -> int | None:
+    """Server-measured dispatch-to-result latency. This is the number the
+    speed requirement is about: it excludes however far away the operator
+    happens to be, and includes everything the system itself contributes."""
+    if dispatched_at is None or completed_at is None:
+        return None
+    return max(0, round((completed_at - dispatched_at) * 1000))
 
 
 def row_to_view(row: dict) -> dict:
@@ -53,6 +64,7 @@ def row_to_view(row: dict) -> dict:
         "stdout": row["stdout"] or "",
         "stderr": row["stderr"] or "",
         "durationMs": row["duration_ms"],
+        "roundTripMs": round_trip_ms(row["dispatched_at"], row["completed_at"]),
         "stdoutTruncated": bool(row["stdout_truncated"]),
         "stderrTruncated": bool(row["stderr_truncated"]),
         "error": row["error"],
@@ -108,6 +120,11 @@ class JobStore:
     def recent(self, limit: int = 50) -> list[dict]:
         return [row_to_view(r) for r in self._store.recent_jobs(limit)]
 
+    def page(self, page: int, page_size: int, **filters) -> dict:
+        result = self._store.page_jobs(page, page_size, **filters)
+        result["items"] = [row_to_view(row) for row in result["items"]]
+        return result
+
     def mark_dispatched(self, job: JobRecord) -> None:
         job.state = JobState.DISPATCHED
         job.dispatched_at = time.time()
@@ -122,6 +139,7 @@ class JobStore:
             return
         job.state = state
         job.result = result
+        job.completed_at = time.time()
         self._store.complete_job(job.job_id, state.value, result)
         if not job.completion.done():
             job.completion.set_result(result)

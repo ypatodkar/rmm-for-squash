@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Operator CLI for the Squash RMM control plane.
+#
+#   export SQUASH_SERVER=http://35.173.64.136:5200
+#   export SQUASH_KEY=$(cat ~/.squash/operator.key)
+#
+#   squashctl devices
+#   squashctl install                     # token + command for a brand-new machine
+#   squashctl upgrade <device-id|host>    # replace the binary remotely, no token, no RDP
+#   squashctl reinstall <device-id|host>  # recovery token, for a machine whose key is gone
+#   squashctl revoke <device-id|host>
+#   squashctl restore <device-id|host>
+#   squashctl run <device-id|host> '<powershell>'
+set -euo pipefail
+
+SERVER="${SQUASH_SERVER:-}"
+KEY="${SQUASH_KEY:-}"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+[[ -n $SERVER ]] || die "set SQUASH_SERVER (e.g. http://35.173.64.136:5200)"
+[[ -n $KEY ]] || die "set SQUASH_KEY (your operator API key)"
+
+api() {
+  local method=$1 path=$2 body=${3:-}
+  local args=(-sS -X "$method" -H "X-API-Key: $KEY")
+  [[ -n $body ]] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" "$SERVER$path"
+}
+
+# Accepts a device id or a hostname and returns the device id.
+resolve() {
+  local needle=$1
+  api GET /api/devices | python3 -c '
+import json, sys
+needle = sys.argv[1].lower()
+devices = json.load(sys.stdin)
+for d in devices:
+    if d["deviceId"].lower() == needle:
+        print(d["deviceId"]); sys.exit(0)
+matches = [d for d in devices if needle in d["hostname"].lower()]
+if len(matches) == 1:
+    print(matches[0]["deviceId"]); sys.exit(0)
+if not matches:
+    sys.exit("no device matches " + sys.argv[1])
+sys.exit("ambiguous: " + ", ".join(d["hostname"] for d in matches))
+' "$needle"
+}
+
+print_install_command() {
+  local token=$1 label=$2
+  cat <<EOF
+
+$label
+
+Run in an Administrator PowerShell on the endpoint:
+
+  iwr $SERVER/install.ps1 -OutFile i.ps1
+  .\\i.ps1 -Server $SERVER -Token $token
+
+EOF
+}
+
+case "${1:-}" in
+devices)
+  api GET /api/devices | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+if not rows: sys.exit("no devices enrolled")
+print("%-22s %-34s %-7s %s" % ("HOSTNAME", "DEVICE ID", "ONLINE", "REVOKED"))
+for d in rows:
+    print("%-22s %-34s %-7s %s" % (d["hostname"], d["deviceId"], d["online"], d["revoked"]))'
+  ;;
+
+install)
+  token=$(api POST /api/enrollment-tokens '{}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+  print_install_command "$token" "Enrollment token for a machine that has never enrolled. Single use, 1 hour."
+  ;;
+
+reinstall)
+  [[ $# -ge 2 ]] || die "usage: squashctl reinstall <device-id|hostname>"
+  device=$(resolve "$2")
+  token=$(api POST /api/enrollment-tokens "{\"allowRebind\":true,\"deviceId\":\"$device\"}" \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "token" not in d: sys.exit(d.get("detail","could not mint recovery token"))
+print(d["token"])')
+  print_install_command "$token" "Recovery token for $2 ($device).
+It replaces that machine's key and works on no other device.
+Uninstall first with:  iwr $SERVER/uninstall.ps1 -OutFile u.ps1; .\\u.ps1"
+  ;;
+
+upgrade)
+  # Self-update over the agent's own connection. The installer is launched from
+  # a detached scheduled task because the agent is about to stop its own
+  # service, which would otherwise kill the script mid-flight.
+  [[ $# -ge 2 ]] || die "usage: squashctl upgrade <device-id|hostname>"
+  device=$(resolve "$2")
+  read -r -d '' PS_SCRIPT <<PS || true
+\$ErrorActionPreference = 'Stop'
+\$server = '$SERVER'
+\$inner  = "iwr \$server/install.ps1 -OutFile C:\\Windows\\Temp\\squash-install.ps1; " +
+          "& C:\\Windows\\Temp\\squash-install.ps1 -Server \$server *> C:\\Windows\\Temp\\squash-install.log"
+\$action = New-ScheduledTaskAction -Execute 'powershell.exe' \`
+  -Argument ('-NoProfile -ExecutionPolicy Bypass -Command "' + \$inner + '"')
+\$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(20)
+Register-ScheduledTask -TaskName 'SquashSelfUpgrade' -Action \$action -Trigger \$trigger \`
+  -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+"upgrade scheduled; the agent will drop off briefly and return on the new build"
+PS
+  job=$(api POST "/api/devices/$device/jobs" \
+    "$(python3 -c 'import json,sys;print(json.dumps({"script":sys.stdin.read(),"timeoutSeconds":60}))' <<<"$PS_SCRIPT")" \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "jobId" not in d: sys.exit(d.get("detail","dispatch failed"))
+print(d["jobId"])')
+  api GET "/api/jobs/$job?waitMs=65000" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+print("dispatch:", r["state"], "-", (r["stdout"] or r["error"] or "").strip())
+sys.exit(0 if r["state"] == "Completed" else 1)'
+  printf 'waiting for the agent to come back'
+  for _ in $(seq 1 30); do
+    sleep 5; printf '.'
+    online=$(api GET /api/devices | python3 -c '
+import json,sys
+want=sys.argv[1]
+print(next((str(d["online"]) for d in json.load(sys.stdin) if d["deviceId"]==want), "False"))' "$device")
+    [[ $online == True ]] && { printf ' back online\n'; exit 0; }
+  done
+  printf '\n'
+  die "agent did not reconnect; check C:\\Windows\\Temp\\squash-install.log on the endpoint"
+  ;;
+
+revoke|restore)
+  [[ $# -ge 2 ]] || die "usage: squashctl $1 <device-id|hostname>"
+  device=$(resolve "$2")
+  action=$([[ $1 == revoke ]] && echo revoke || echo unrevoke)
+  api POST "/api/devices/$device/$action" '{}' | python3 -m json.tool
+  ;;
+
+run)
+  [[ $# -ge 3 ]] || die "usage: squashctl run <device-id|hostname> '<powershell>'"
+  device=$(resolve "$2")
+  job=$(api POST "/api/devices/$device/jobs" \
+    "$(python3 -c 'import json,sys;print(json.dumps({"script":sys.argv[1],"timeoutSeconds":60}))' "$3")" \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "jobId" not in d: sys.exit(d.get("detail","dispatch failed"))
+print(d["jobId"])')
+  api GET "/api/jobs/$job?waitMs=65000" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+print("state %s  exit %s  exec %sms  round-trip %sms"
+      % (r["state"], r["exitCode"], r["durationMs"], r["roundTripMs"]))
+print("-" * 60)
+if r["stdout"]: print(r["stdout"], end="")
+if r["stderr"]: print("STDERR:", r["stderr"], file=sys.stderr)
+if r["error"]: print("ERROR:", r["error"], file=sys.stderr)
+sys.exit(0 if r["state"] == "Completed" and r["exitCode"] == 0 else 1)'
+  ;;
+
+*)
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac
