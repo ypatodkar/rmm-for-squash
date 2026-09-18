@@ -133,26 +133,12 @@ Uninstall first with:  iwr $SERVER/uninstall.ps1 -OutFile u.ps1; .\\u.ps1"
   ;;
 
 upgrade)
-  # Self-update over the agent's own connection. The installer is launched from
-  # a detached scheduled task because the agent is about to stop its own
-  # service, which would otherwise kill the script mid-flight.
+  # Reinstalls in place over the agent's own connection. The control plane
+  # owns the script (POST /api/devices/{id}/upgrade); this waits for the
+  # agent to come back on the new build.
   [[ $# -ge 2 ]] || die "usage: squashctl upgrade <device-id|hostname>"
   device=$(resolve "$2")
-  read -r -d '' PS_SCRIPT <<PS || true
-\$ErrorActionPreference = 'Stop'
-\$server = '$SERVER'
-\$inner  = "iwr \$server/install.ps1 -OutFile C:\\Windows\\Temp\\squash-install.ps1; " +
-          "& C:\\Windows\\Temp\\squash-install.ps1 -Server \$server *> C:\\Windows\\Temp\\squash-install.log"
-\$action = New-ScheduledTaskAction -Execute 'powershell.exe' \`
-  -Argument ('-NoProfile -ExecutionPolicy Bypass -Command "' + \$inner + '"')
-\$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(20)
-Register-ScheduledTask -TaskName 'SquashSelfUpgrade' -Action \$action -Trigger \$trigger \`
-  -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
-"upgrade scheduled; the agent will drop off briefly and return on the new build"
-PS
-  job=$(api POST "/api/devices/$device/jobs" \
-    "$(python3 -c 'import json,sys;print(json.dumps({"script":sys.stdin.read(),"timeoutSeconds":60}))' <<<"$PS_SCRIPT")" \
-    | python3 -c 'import json,sys
+  job=$(api POST "/api/devices/$device/upgrade" '{}' | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 if "jobId" not in d: sys.exit(d.get("detail","dispatch failed"))
 print(d["jobId"])')
@@ -161,14 +147,18 @@ import json, sys
 r = json.load(sys.stdin)
 print("dispatch:", r["state"], "-", (r["stdout"] or r["error"] or "").strip())
 sys.exit(0 if r["state"] == "Completed" else 1)'
+  # The agent stays online until the task fires, so "online" proves nothing.
+  # What counts is a reconnect recorded after the request, judged on the
+  # server's clock rather than this machine's.
+  since=$(api GET "/api/jobs/$job" | python3 -c 'import json,sys;print(json.load(sys.stdin)["createdAt"])')
   printf 'waiting for the agent to come back'
-  for _ in $(seq 1 30); do
+  for _ in $(seq 1 36); do
     sleep 5; printf '.'
-    online=$(api GET /api/devices | python3 -c '
+    back=$(api GET "/api/devices/$device/events?limit=20" | python3 -c '
 import json,sys
-want=sys.argv[1]
-print(next((str(d["online"]) for d in json.load(sys.stdin) if d["deviceId"]==want), "False"))' "$device")
-    [[ $online == True ]] && { printf ' back online\n'; exit 0; }
+since=float(sys.argv[1])
+print(any(e["event"] in ("online","rebooted") and e["at"] > since for e in json.load(sys.stdin)))' "$since")
+    [[ $back == True ]] && { printf ' back online\n'; exit 0; }
   done
   printf '\n'
   die "agent did not reconnect; check C:\\Windows\\Temp\\squash-install.log on the endpoint"

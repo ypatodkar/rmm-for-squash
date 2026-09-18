@@ -1,4 +1,4 @@
-# Control Plane API - Simplified Guide
+# Control Plane API Guide
 
 This API controls Windows devices, runs scripts, and uses AI for diagnostics. Everything uses standard HTTP and JSON.
 
@@ -150,6 +150,37 @@ curl -sX POST $HOST/api/devices/$DEVICE/unrevoke -H "X-API-Key: $KEY"
 
 ```json
 { "deviceId": "a1b2c3…", "revoked": false }
+```
+
+### Upgrade (reinstall) the agent
+Reinstalls the agent in place with whatever build the server is currently serving. The device keeps its ID, key and history, and no token is needed. The agent must be online; if it's gone or its key is lost, use a recovery token (`allowRebind`, section 2) and run the installer on the machine.
+
+The script is the server's, not yours: it reinstalls from the server the device is enrolled with, into the folder its service is registered in. The only optional field is `idempotencyKey`.
+
+```bash
+# Upgrade one device
+curl -sX POST $HOST/api/devices/$DEVICE/upgrade -H "X-API-Key: $KEY"
+
+# With a safe retry key
+curl -sX POST $HOST/api/devices/$DEVICE/upgrade \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey": "upgrade-2026-09-18"}'
+```
+
+```json
+{ "jobId": "…", "state": "Dispatched", "startsInSeconds": 20 }
+```
+
+`202` means the upgrade is **scheduled**, not finished. The job completes within seconds with `stdout` reading `upgrade scheduled from https://…`. About 20 seconds later the agent goes offline, reinstalls, and reconnects. To know it's back, look for an `online` event newer than the job's `createdAt` in `GET /api/devices/{deviceId}/events`. Don't use `online` in `GET /api/devices`: it stays true until the upgrade actually starts.
+
+Publish the new `SquashRmm.Agent.exe` and its `.sha256` to the server **before** calling this, or it reinstalls the old build. If the agent doesn't come back, the installer's log is at `C:\Windows\Temp\squash-install.log` on the endpoint.
+
+Same checks as any job: `404` if not enrolled, `403` if revoked, `409` if offline. Shows up in the audit log as `device.upgrade`, and in device history as `upgrade_requested`.
+
+From the CLI, which also waits for the agent to come back:
+
+```bash
+squashctl upgrade WIN-DEMO-1
 ```
 
 ---

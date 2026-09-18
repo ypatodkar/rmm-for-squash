@@ -82,6 +82,12 @@ class RestartRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class UpgradeRequest(BaseModel):
+    idempotency_key: str | None = Field(default=None, alias="idempotencyKey")
+
+    model_config = {"populate_by_name": True}
+
+
 class EnrollRequest(BaseModel):
     token: str
     device_id: str = Field(alias="deviceId")
@@ -472,6 +478,36 @@ async def restart_device(device_id: str, request: RestartRequest | None = None,
                                    "delaySeconds": request.delay_seconds})
     return {**result, "restartAt": time.time() + request.delay_seconds,
             "delaySeconds": request.delay_seconds}
+
+
+@app.post("/api/devices/{device_id}/upgrade", status_code=202)
+async def upgrade_device(device_id: str, request: UpgradeRequest | None = None,
+                         operator: str = Depends(require_operator)) -> dict:
+    """Reinstalls the agent in place with whatever build this server serves.
+
+    Like restart, it has its own route so the script lives in one place and
+    reads as itself in the audit log. The caller supplies nothing that reaches
+    the script: it reinstalls from the server the endpoint is enrolled with,
+    into the directory the service is registered in.
+
+    The response means the upgrade is scheduled, not finished. The agent drops
+    off about UPGRADE_DELAY_SECONDS later and reconnects on the new build;
+    callers watch GET /api/devices for it to come back online. It needs the
+    agent to be connected -- a machine whose agent is gone needs a recovery
+    token and someone on the machine.
+    """
+    request = request or UpgradeRequest()
+    result = await send_to_device(
+        device_id, protocol.UPGRADE_SCRIPT,
+        # Only schedules a task and returns; the installer runs afterwards.
+        timeout_seconds=60, max_output_bytes=4096,
+        operator=operator, idempotency_key=request.idempotency_key,
+        action="device.upgrade",
+        detail={"startsInSeconds": protocol.UPGRADE_DELAY_SECONDS})
+
+    if not result.get("deduplicated"):
+        store.record_device_event(device_id, "upgrade_requested", {"operator": operator})
+    return {**result, "startsInSeconds": protocol.UPGRADE_DELAY_SECONDS}
 
 
 @app.get("/api/jobs/{job_id}")

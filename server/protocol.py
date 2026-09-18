@@ -235,6 +235,45 @@ def hello_ack(device_id: str, heartbeat_interval_seconds: int) -> dict:
     }
 
 
+# ---------- upgrade ----------
+
+UPGRADE_DELAY_SECONDS = 20
+
+# Reinstalls the agent in place, from the server it is enrolled with. It takes
+# no input from the caller: the server URL comes from the configuration the
+# installer wrote on the endpoint, and the install directory from the service's
+# own registration, so nothing a caller sends can reach this script.
+#
+# The installer is started from a detached scheduled task because it stops the
+# agent's service -- the process this script is running under. The machine
+# still holds its key, so the installer upgrades without a token and the
+# device keeps its identity and history.
+UPGRADE_SCRIPT = r"""$ErrorActionPreference = 'Stop'
+$service = Get-CimInstance Win32_Service -Filter "Name='SquashEndpoint'"
+if (-not $service) { throw 'the SquashEndpoint service is not registered' }
+$dir = Split-Path -Parent ($service.PathName.Trim('"'))
+$settings = Get-Content -Raw (Join-Path $dir 'appsettings.json') | ConvertFrom-Json
+$server = $settings.Server.Url -replace '^wss://', 'https://' -replace '^ws://', 'http://'
+# Interpolated into a command line below, so it must be a plain URL.
+if ($server -notmatch '^https?://[A-Za-z0-9.\-]+(:[0-9]+)?/?$') {
+    throw "unexpected server URL in appsettings.json: $server"
+}
+$server = $server.TrimEnd('/')
+if ($dir -notmatch '^[A-Za-z]:\\[A-Za-z0-9 ._\\()\-]+$') {
+    throw "unexpected install directory: $dir"
+}
+$inner = "iwr $server/install.ps1 -OutFile C:\Windows\Temp\squash-install.ps1; " +
+         "& C:\Windows\Temp\squash-install.ps1 -Server $server -InstallDir '$dir' " +
+         "*> C:\Windows\Temp\squash-install.log"
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument ('-NoProfile -ExecutionPolicy Bypass -Command "' + $inner + '"')
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(__DELAY__)
+Register-ScheduledTask -TaskName 'SquashSelfUpgrade' -Action $action -Trigger $trigger `
+    -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+"upgrade scheduled from $server; the agent will drop off briefly and return on the new build"
+""".replace("__DELAY__", str(UPGRADE_DELAY_SECONDS))
+
+
 # ---------- restart ----------
 
 DEFAULT_RESTART_REASON = "Restart requested from Squash RMM"
