@@ -114,6 +114,9 @@
   .topnav a { padding: 13px 0; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; }
   .topnav a[aria-current="page"] { color: var(--text); border-color: var(--accent); }
   .secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .danger { background: var(--err); color: #fff; }
+  .danger:hover:not(:disabled) { background: #ff6257; }
+  .danger-row { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; }
   .inv-page { display: block; max-width: 1440px; margin: auto; padding: 28px 24px; }
   .inv-heading, .inv-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .inv-heading { margin-bottom: 22px; }
@@ -231,8 +234,14 @@
         <span class="chip" data-s="Start-Sleep -Seconds 60">force timeout</span>
         <span class="chip" data-s="Get-PSDrive -PSProvider FileSystem | Select-Object Name,@{N='FreeGB';E={[math]::Round($_.Free/1GB,2)}},@{N='PctFree';E={[math]::Round(100*$_.Free/($_.Used+$_.Free),1)}} | Format-Table -AutoSize | Out-String">disk space</span>
         <span class="chip" data-s="Get-Process | Sort-Object WS -Descending | Select-Object -First 5 Name,@{N='MemoryMB';E={[math]::Round($_.WS/1MB)}} | Format-Table -AutoSize | Out-String">top memory</span>
-        <span class="chip" data-confirm="1"
-              data-s="shutdown.exe /r /t 15 /c &quot;Restart requested from Squash RMM&quot;; &quot;restart scheduled in 15s&quot;">restart machine</span>
+      </div>
+      <!-- Restarting is the one destructive action here, so it is a button of
+           its own rather than another preset: the presets only read state, and
+           a row of look-alike chips is the wrong place for something that
+           interrupts whoever is using the machine. -->
+      <div class="row danger-row">
+        <button id="restart-device" class="danger" disabled>Restart device…</button>
+        <span class="sub" id="restart-note">Interrupts anyone using it. Unsaved work is lost.</span>
       </div>
       <section id="activity" class="activity" data-tone="working" aria-label="Command activity" hidden>
         <div class="activity-head">
@@ -415,7 +424,7 @@ function renderDevices(list) {
   const el = $("devices");
   if (!list.length) {
     el.innerHTML = '<div class="empty">No devices enrolled.</div>';
-    selected = null; $("run").disabled = true;
+    selected = null; $("run").disabled = true; $("restart-device").disabled = true;
     return;
   }
   if (selected && !list.some(d => d.deviceId === selected)) selected = null;
@@ -450,6 +459,7 @@ function renderDevices(list) {
 
 function updateRunButton() {
   $("run").disabled = commandBusy || !currentDevices.find(d => d.deviceId === selected)?.online;
+  $("restart-device").disabled = $("run").disabled;
 }
 
 function activityElapsed(run) {
@@ -731,15 +741,29 @@ $("run").onclick = async () => {
   finally { finishWatching(); }
 };
 
-// A preset that disrupts the machine is confirmed before it is even loaded
-// into the box, so it cannot be run by a stray click on a familiar row.
 document.querySelectorAll(".chip[data-s]").forEach(c =>
-  c.onclick = () => {
-    const device = deviceNames.get(selected) || selected;
-    if (c.dataset.confirm &&
-        !confirm(`Restart ${device}?\n\nThe machine will go offline and take about a minute to return.`)) return;
-    $("script").value = c.dataset.s;
-  });
+  c.onclick = () => { $("script").value = c.dataset.s; });
+
+// Restarting asks for the hostname to be typed rather than offering a dialog to
+// dismiss. The point is not ceremony: it makes it impossible to restart the
+// wrong machine by confirming out of habit after changing the selection.
+$("restart-device").onclick = async () => {
+  const hostname = deviceNames.get(selected) || selected;
+  if (!hostname) return;
+  const typed = prompt(
+    `Restart ${hostname}?\n\n` +
+    `It will go offline for about a minute, and anything unsaved on it is lost.\n\n` +
+    `Type the device name to confirm:`);
+  if (typed === null) return;
+  if (typed.trim().toLowerCase() !== String(hostname).toLowerCase()) {
+    $("restart-note").textContent = "Name did not match. Nothing was restarted.";
+    return;
+  }
+  $("restart-note").textContent = `Restart requested on ${hostname}.`;
+  $("script").value =
+    'shutdown.exe /r /t 15 /c "Restart requested from Squash RMM"; "restart scheduled in 15s"';
+  $("run").click();
+};
 
 let installCommand = "";
 
