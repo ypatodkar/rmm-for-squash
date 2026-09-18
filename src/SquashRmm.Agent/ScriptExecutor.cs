@@ -10,6 +10,24 @@ public sealed class ScriptExecutor(ILogger<ScriptExecutor> log)
 {
     public async Task<JobResult> RunAsync(JobSpec job, CancellationToken ct)
     {
+        // What executes must be what was dispatched. The hash travels with the
+        // script, so this is checked before anything starts rather than
+        // discovered afterwards from the result.
+        var actualSha = Sha256Hex(job.Script);
+        if (!string.Equals(job.ScriptSha256, actualSha, StringComparison.OrdinalIgnoreCase))
+        {
+            log.LogWarning("Job {JobId} refused: script does not match its dispatched hash", job.JobId);
+            return new JobResult
+            {
+                JobId = job.JobId,
+                State = JobState.Failed,
+                ScriptSha256 = actualSha,
+                Error = job.ScriptSha256 is null
+                    ? "Refused: the dispatch carried no script hash."
+                    : "Refused: the script does not match the hash it was dispatched with."
+            };
+        }
+
         var stopwatch = Stopwatch.StartNew();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(TimeSpan.FromSeconds(job.TimeoutSeconds));
@@ -53,8 +71,8 @@ public sealed class ScriptExecutor(ILogger<ScriptExecutor> log)
             process.StandardInput.Close();
         }
 
-        var stdoutTask = ReadCappedAsync(process.StandardOutput, job.MaxOutputBytes, ct);
-        var stderrTask = ReadCappedAsync(process.StandardError, job.MaxOutputBytes, ct);
+        var stdoutTask = OutputCapture.ReadAsync(process.StandardOutput, job.MaxOutputBytes, ct);
+        var stderrTask = OutputCapture.ReadAsync(process.StandardError, job.MaxOutputBytes, ct);
 
         try
         {
@@ -122,39 +140,6 @@ public sealed class ScriptExecutor(ILogger<ScriptExecutor> log)
         }
 
         return info;
-    }
-
-    private static async Task<(string Text, bool Truncated)> ReadCappedAsync(
-        StreamReader reader, int maxBytes, CancellationToken ct)
-    {
-        var builder = new StringBuilder();
-        var buffer = new char[4096];
-        var truncated = false;
-
-        while (true)
-        {
-            int read;
-            try
-            {
-                read = await reader.ReadAsync(buffer, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            if (read == 0) break;
-
-            if (builder.Length >= maxBytes)
-            {
-                truncated = true;
-                continue;
-            }
-
-            builder.Append(buffer, 0, Math.Min(read, maxBytes - builder.Length));
-        }
-
-        return (builder.ToString(), truncated);
     }
 
     private static void TryKill(Process process)

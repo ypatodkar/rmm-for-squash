@@ -117,6 +117,19 @@ class JobStore:
     def active(self) -> list[JobRecord]:
         return [j for j in self._jobs.values() if not j.state.is_terminal]
 
+    def evict_finished(self, older_than_seconds: float) -> int:
+        """Drops finished jobs from memory; SQLite keeps their history, and
+        view() already falls back to it. The delay lets a late result for a
+        job the supervisor just timed out still find it and be ignored
+        quietly, as before."""
+        cutoff = time.time() - older_than_seconds
+        finished = [job_id for job_id, job in self._jobs.items()
+                    if job.state.is_terminal and job.completed_at is not None
+                    and job.completed_at < cutoff]
+        for job_id in finished:
+            del self._jobs[job_id]
+        return len(finished)
+
     def recent(self, limit: int = 50) -> list[dict]:
         return [row_to_view(r) for r in self._store.recent_jobs(limit)]
 

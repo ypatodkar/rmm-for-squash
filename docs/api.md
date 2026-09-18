@@ -125,7 +125,7 @@ curl -s "$HOST/api/devices/$DEVICE/events?limit=20" -H "X-API-Key: $KEY"
 
 ```json
 [
-  { "event": "reboot", "at": 1758100000.0, "detail": "{\"previousUptimeSeconds\":54321}" },
+  { "event": "rebooted", "at": 1758100000.0, "detail": "{\"previousUptimeSeconds\":54321}" },
   { "event": "restart_requested", "at": 1758099980.0, "detail": "{\"operator\":\"ops\",\"delaySeconds\":15}" }
 ]
 ```
@@ -208,9 +208,20 @@ curl -sX POST $HOST/api/devices/$DEVICE/jobs \
 { "jobId": "…", "state": "Dispatched" }
 ```
 
+| Field | Default | Limit |
+|---|---|---|
+| `script` | required | Up to 12,000 characters. Windows passes the script to PowerShell on a command line capped at 32,767 characters, so a longer script could never start; it gets `422` instead. |
+| `timeoutSeconds` | `30` | 1–600 |
+| `maxOutputBytes` | `1048576` | 1,024 – 4,194,304 (4 MiB), per stream, counted in UTF-8 bytes |
+| `idempotencyKey` | none | Optional |
+
+Sending the same request again with the same `idempotencyKey` returns the original job with `"state": "Duplicate"` and runs nothing. Reusing a key for a **different** request (another script, device, timeout or operator) returns `409` rather than someone else's job.
+
 ### Check the results
 Use `waitMs` to wait for the script to finish without spamming the server. 
 **Note:** `Completed` just means it ran. Always check the `exitCode`. Do not trust output if `stdoutTruncated` is true.
+
+The server checks every result before storing it: `exitCode` and `durationMs` must be whole numbers and `state` must be a finished state, or the job becomes `Failed` with `"error": "Result rejected: malformed result: …"`. Output longer than `maxOutputBytes` is cut there and flagged, even if an agent sent more.
 
 ```bash
 curl -s "$HOST/api/jobs/$JOB?waitMs=20000" -H "X-API-Key: $KEY"
@@ -377,8 +388,10 @@ The agent initiates the connection (allowing it to work behind NATs).
 {"type":"job_accepted","jobId":"…"}
 
 // device → 
-{"type":"job_result","result":{"jobId":"…","exitCode":0,"stdout":"…","stderr":"…","durationMs":150,"attestation":"<signature>"}}
+{"type":"job_result","result":{"jobId":"…","state":"Completed","exitCode":0,"stdout":"…","stderr":"…","durationMs":150,"stdoutTruncated":false,"stderrTruncated":false,"scriptSha256":"…","signature":"…"}}
 ```
+
+Before running anything, the agent hashes the script it received and compares it with `scriptSha256`; on a mismatch it refuses and reports `Failed` without starting a process. All of a session's messages go out through one sender, so a heartbeat and a finishing job never write to the socket at the same time.
 
 ---
 

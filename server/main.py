@@ -13,12 +13,12 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import auth
 import protocol
 from jobs import JobStore
-from protocol import JobState, hello_ack, job_dispatch, parse_job_state
+from protocol import JobState, hello_ack, job_dispatch
 from registry import HEARTBEAT_INTERVAL_SECONDS, DeviceConnection, DeviceRegistry
 from store import Store
 
@@ -27,6 +27,8 @@ log = logging.getLogger("controlplane")
 
 SUPERVISOR_TICK_SECONDS = 1.0
 TIMEOUT_GRACE_SECONDS = 5.0
+# Finished jobs are served from SQLite; memory holds only what is in flight.
+FINISHED_JOB_RETENTION_SECONDS = 60.0
 STATIC_DIR = Path(__file__).parent / "static"
 DIST_DIR = Path(os.environ.get("SQUASH_DIST", Path(__file__).parent / "dist"))
 DB_PATH = os.environ.get("SQUASH_DB", str(Path(__file__).parent / "squash.db"))
@@ -53,10 +55,19 @@ def require_operator(x_api_key: str | None = Header(default=None)) -> str:
 class DispatchRequest(BaseModel):
     script: str = Field(min_length=1)
     timeout_seconds: int = Field(default=30, ge=1, le=600, alias="timeoutSeconds")
-    max_output_bytes: int = Field(default=1_048_576, ge=1024, alias="maxOutputBytes")
+    max_output_bytes: int = Field(default=1_048_576, ge=1024, le=protocol.MAX_OUTPUT_BYTES,
+                                  alias="maxOutputBytes")
     idempotency_key: str | None = Field(default=None, alias="idempotencyKey")
 
     model_config = {"populate_by_name": True}
+
+    @field_validator("script")
+    @classmethod
+    def _fits_a_command_line(cls, script: str) -> str:
+        if protocol.script_length(script) > protocol.MAX_SCRIPT_CHARS:
+            raise ValueError(f"script is longer than {protocol.MAX_SCRIPT_CHARS} characters, "
+                             "which Windows cannot pass to PowerShell")
+        return script
 
 
 class RestartRequest(BaseModel):
@@ -86,6 +97,7 @@ async def supervise() -> None:
     while True:
         await asyncio.sleep(SUPERVISOR_TICK_SECONDS)
         now = time.time()
+        jobs.evict_finished(FINISHED_JOB_RETENTION_SECONDS)
         for job in jobs.active():
             connection = registry.get(job.device_id)
             if connection is None or not connection.is_reachable:
@@ -371,19 +383,37 @@ async def send_to_device(device_id: str, script: str, *, timeout_seconds: int,
     skipped by adding a new route that forgets one of them.
     """
     if idempotency_key:
-        existing = store.job_id_for_idempotency_key(idempotency_key)
-        if existing:
-            return {"jobId": existing, "state": "Duplicate", "deduplicated": True}
+        earlier = store.job_for_idempotency_key(idempotency_key)
+        if earlier:
+            # A key proves a retry only if the request is the same one. Anything
+            # else is a collision, and answering it with the earlier job would
+            # hand the caller a result from a different script or device.
+            # (maxOutputBytes is not stored, so it is not compared.)
+            same = (earlier["device_id"], earlier["script"], earlier["timeout_seconds"],
+                    earlier["created_by"]) == (device_id, script, timeout_seconds, operator)
+            if not same:
+                store.audit(operator, "job.idempotency_conflict", device_id=device_id,
+                            job_id=earlier["job_id"], detail={"action": action})
+                raise HTTPException(
+                    status_code=409,
+                    detail="This idempotencyKey was already used for a different request.")
+            return {"jobId": earlier["job_id"], "state": "Duplicate", "deduplicated": True}
+
+    def refuse(status_code: int, reason: str) -> HTTPException:
+        # The caller learns at once; the attempt still leaves a record.
+        store.audit(operator, "job.refused", device_id=device_id,
+                    detail={"action": action, "reason": reason})
+        return HTTPException(status_code=status_code, detail=f"Device '{device_id}' {reason}.")
 
     device = store.get_device(device_id)
     if device is None:
-        raise HTTPException(status_code=404, detail=f"Device '{device_id}' is not enrolled.")
+        raise refuse(404, "is not enrolled")
     if device["revoked"]:
-        raise HTTPException(status_code=403, detail=f"Device '{device_id}' is revoked.")
+        raise refuse(403, "is revoked")
 
     connection = registry.get(device_id)
     if connection is None or not connection.is_reachable:
-        raise HTTPException(status_code=409, detail=f"Device '{device_id}' is not reachable.")
+        raise refuse(409, "is not reachable")
 
     job = jobs.create(device_id, script, timeout_seconds, max_output_bytes,
                       operator, idempotency_key)
@@ -699,6 +729,9 @@ def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:
     carries a signature from the enrolled device's key. Without this, what a
     device reports having run is merely an assertion.
 
+    `payload` is the output of protocol.parse_result, so every field is
+    present and of the right type.
+
     A fleet cannot be upgraded atomically, so an agent predating attestation is
     tolerated while REQUIRE_ATTESTATION is off -- recorded as unverified rather
     than silently trusted, so the gap stays visible in the audit trail.
@@ -725,8 +758,8 @@ def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:
         return False, "device is no longer enrolled"
 
     attestation = protocol.result_attestation(
-        job.job_id, expected_sha, payload.get("exitCode"),
-        payload.get("durationMs") or 0, payload.get("stdout", ""), payload.get("stderr", ""))
+        job.job_id, expected_sha, payload["exitCode"],
+        payload["durationMs"], payload["stdout"], payload["stderr"])
 
     if not auth.verify_device_payload(device["public_key"], attestation, signature):
         return False, "signature does not match the enrolled device key"
@@ -744,6 +777,8 @@ async def _receive_loop(websocket: WebSocket, connection: DeviceConnection) -> N
     while True:
         message = await websocket.receive_json()
         connection.touch()
+        if not isinstance(message, dict):
+            continue
         kind = message.get("type")
 
         if kind == "heartbeat":
@@ -751,39 +786,64 @@ async def _receive_loop(websocket: WebSocket, connection: DeviceConnection) -> N
             continue
 
         if kind == "job_accepted":
-            job = jobs.get(message.get("jobId", ""))
-            if job is not None and job.device_id == connection.device_id \
-                    and job.state is JobState.DISPATCHED:
+            job = _owned_job(message.get("jobId"), connection)
+            if job is not None and job.state is JobState.DISPATCHED:
                 jobs.mark_running(job)
             continue
 
         if kind == "job_result":
-            payload = message.get("result") or {}
-            job = jobs.get(payload.get("jobId", ""))
-            if job is None or job.device_id != connection.device_id:
-                log.warning("device %s returned a result for a job it does not own",
-                            connection.device_id)
-                continue
+            handle_result(message.get("result"), connection)
 
-            verified, reason = verify_result(job, payload, connection.device_id)
-            if not verified:
-                jobs.fail(job, JobState.FAILED, f"Result rejected: {reason}")
-                store.audit("system", "job.result_rejected", device_id=connection.device_id,
-                            job_id=job.job_id, detail={"reason": reason})
-                log.error("job %s result rejected: %s", job.job_id, reason)
-                continue
 
-            state = parse_job_state(payload.get("state", JobState.COMPLETED.value))
-            jobs.complete(job, payload, state)
-            store.audit("device", "job.result", device_id=connection.device_id,
-                        job_id=job.job_id,
-                        detail={"state": state.value, "exitCode": payload.get("exitCode"),
-                                "durationMs": payload.get("durationMs"),
-                                "attested": True})
+def handle_result(payload: object, connection: DeviceConnection) -> None:
+    """Checks, in order: that the job is this device's, that the result has
+    the protocol's shape, that the device signed it, and that it fits the
+    limit the job was dispatched with. Only then is it stored."""
+    job = _owned_job(payload.get("jobId") if isinstance(payload, dict) else None, connection)
+    if job is None:
+        log.warning("device %s returned a result for a job it does not own",
+                    connection.device_id)
+        return
+
+    try:
+        result = protocol.parse_result(payload)
+    except protocol.MalformedResult as error:
+        _reject_result(job, connection, f"malformed result: {error}")
+        return
+
+    verified, reason = verify_result(job, result, connection.device_id)
+    if not verified:
+        _reject_result(job, connection, reason)
+        return
+
+    result = protocol.limit_output(result, job.max_output_bytes)
+    state = result["state"]
+    jobs.complete(job, result, state)
+    store.audit("device", "job.result", device_id=connection.device_id,
+                job_id=job.job_id,
+                detail={"state": state.value, "exitCode": result["exitCode"],
+                        "durationMs": result["durationMs"], "attested": True})
+
+
+def _owned_job(job_id: object, connection: DeviceConnection):
+    """The in-flight job with this id, if it belongs to this connection's
+    device. Anything else -- a missing id, a non-string, another device's
+    job -- is None rather than an exception that would drop the socket."""
+    if not isinstance(job_id, str):
+        return None
+    job = jobs.get(job_id)
+    return job if job is not None and job.device_id == connection.device_id else None
+
+
+def _reject_result(job, connection: DeviceConnection, reason: str) -> None:
+    jobs.fail(job, JobState.FAILED, f"Result rejected: {reason}")
+    store.audit("system", "job.result_rejected", device_id=connection.device_id,
+                job_id=job.job_id, detail={"reason": reason})
+    log.error("job %s result rejected: %s", job.job_id, reason)
 
 
 # ==================================================================
-# Investigations -- see docs/investigations-ui-contract.md.
+# Investigations -- see docs/design.md and docs/api.md.
 #
 # The AI driver (diagnosis loop, repair catalogue, approval binding, budget)
 # lives in ../driver and is imported by investigations.py, which owns the

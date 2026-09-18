@@ -46,12 +46,143 @@ def parse_job_state(value: Any) -> JobState:
     if isinstance(value, bool):
         raise ValueError(f"invalid job state: {value!r}")
     if isinstance(value, int):
+        # A negative index is valid Python and would silently pick a state.
+        if not 0 <= value < len(_BY_ORDINAL):
+            raise ValueError(f"invalid job state: {value!r}")
         return _BY_ORDINAL[value]
     return JobState(value)
 
 
 def sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()
+    return hashlib.sha256(utf8(value)).hexdigest()
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def utf8(value: str) -> bytes:
+    """UTF-8 bytes the way the agent computes them. .NET replaces each
+    unpaired surrogate with one U+FFFD where Python would raise, and a hash
+    that raises on one side and succeeds on the other is a crash, not a
+    mismatch. (JSON decoding has already joined every valid pair.)"""
+    return _LONE_SURROGATE.sub("\ufffd", value).encode()
+
+
+# ---------- dispatch limits ----------
+
+# The agent hands a script to PowerShell as base64 of UTF-16 on the command
+# line, and Windows caps a command line at 32,767 characters. With the agent's
+# preamble and arguments that leaves about 12,170 UTF-16 code units of script;
+# this keeps a margin. A longer script cannot start at all, so refusing it at
+# the API gives the caller a clear answer instead of a failed job.
+MAX_SCRIPT_CHARS = 12_000
+
+# Both streams, JSON-escaped, travel in one WebSocket message, and the server
+# accepts messages up to 16 MiB. Four MiB per stream keeps ordinary output
+# comfortably inside that.
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
+
+def script_length(script: str) -> int:
+    """Length as PowerShell will receive it, in UTF-16 code units."""
+    return len(script.encode("utf-16-le", "surrogatepass")) // 2
+
+
+# ---------- job results ----------
+
+# A result is untrusted input even when it is correctly signed: the device
+# holds its own key and can sign anything. Every field is checked for type and
+# range before it is stored or shown, because the stored form is what callers,
+# the dashboard and the AI driver all read.
+_INT32 = (-2**31, 2**31 - 1)
+MAX_DURATION_MS = 7 * 24 * 3600 * 1000
+MAX_ERROR_CHARS = 2000
+
+
+class MalformedResult(ValueError):
+    """The result does not have the shape the protocol defines."""
+
+
+def _int_field(payload: dict, name: str, low: int, high: int, *, optional: bool) -> int | None:
+    value = payload.get(name)
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MalformedResult(f"{name} must be a whole number")
+    if not low <= value <= high:
+        raise MalformedResult(f"{name} is out of range")
+    return value
+
+
+def _text_field(payload: dict, name: str) -> str:
+    value = payload.get(name, "")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise MalformedResult(f"{name} must be text")
+    # Keep what .NET would have hashed: an unpaired surrogate becomes U+FFFD.
+    return utf8(value).decode()
+
+
+def _flag_field(payload: dict, name: str) -> bool:
+    value = payload.get(name, False)
+    if not isinstance(value, bool):
+        raise MalformedResult(f"{name} must be true or false")
+    return value
+
+
+def parse_result(payload: object) -> dict:
+    """Returns a clean copy of an endpoint's job result, or raises
+    MalformedResult. Only fields the protocol defines survive."""
+    if not isinstance(payload, dict):
+        raise MalformedResult("result must be an object")
+
+    try:
+        state = parse_job_state(payload.get("state", JobState.COMPLETED.value))
+    except (ValueError, IndexError, TypeError):
+        raise MalformedResult("state is not a job state") from None
+    if not state.is_terminal:
+        raise MalformedResult(f"a result cannot leave a job {state.value}")
+
+    error = payload.get("error")
+    if error is not None and not isinstance(error, str):
+        raise MalformedResult("error must be text")
+
+    for name in ("scriptSha256", "signature"):
+        if payload.get(name) is not None and not isinstance(payload[name], str):
+            raise MalformedResult(f"{name} must be text")
+
+    return {
+        "jobId": payload.get("jobId"),
+        "state": state,
+        "exitCode": _int_field(payload, "exitCode", *_INT32, optional=True),
+        "durationMs": _int_field(payload, "durationMs", 0, MAX_DURATION_MS, optional=True) or 0,
+        "stdout": _text_field(payload, "stdout"),
+        "stderr": _text_field(payload, "stderr"),
+        "stdoutTruncated": _flag_field(payload, "stdoutTruncated"),
+        "stderrTruncated": _flag_field(payload, "stderrTruncated"),
+        "error": utf8(error).decode()[:MAX_ERROR_CHARS] if error else None,
+        "scriptSha256": payload.get("scriptSha256"),
+        "signature": payload.get("signature"),
+    }
+
+
+def limit_output(result: dict, max_bytes: int) -> dict:
+    """Holds a result to the byte limit the job was dispatched with.
+
+    Applied after the signature is checked, since the device signed what it
+    sent. Output over the limit is cut at a character boundary and flagged
+    rather than rejected: a caller that asked for at most N bytes gets at most
+    N bytes and is told it was cut, which is the contract whether the agent
+    honoured it or not.
+    """
+    limited = dict(result)
+    for stream in ("stdout", "stderr"):
+        encoded = limited[stream].encode()
+        if len(encoded) > max_bytes:
+            limited[stream] = encoded[:max_bytes].decode("utf-8", "ignore")
+            limited[f"{stream}Truncated"] = True
+    return limited
 
 
 _CONTROL_CHARS = {c: None for c in range(0x20) if c not in (0x09,)}

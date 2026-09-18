@@ -3,4 +3,7 @@
     <Project Path="src/SquashRmm.Agent/SquashRmm.Agent.csproj" />
     <Project Path="src/SquashRmm.Protocol/SquashRmm.Protocol.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SquashRmm.Agent.Tests/SquashRmm.Agent.Tests.csproj" />
+  </Folder>
 </Solution>

@@ -67,7 +67,8 @@ public sealed class AgentWorker(
 
         var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64);
 
-        await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentHello
+        var sender = new MessageSender(socket);
+        await sender.SendAsync((AgentMessage)new AgentHello
         {
             DeviceId = deviceId,
             Hostname = Environment.MachineName,
@@ -84,8 +85,8 @@ public sealed class AgentWorker(
         log.LogInformation("Connected. Heartbeat every {Interval}s", ack.HeartbeatIntervalSeconds);
 
         using var session = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var heartbeat = HeartbeatLoopAsync(socket, ack.HeartbeatIntervalSeconds, session.Token);
-        var receive = ReceiveLoopAsync(socket, credential, session.Token);
+        var heartbeat = HeartbeatLoopAsync(sender, ack.HeartbeatIntervalSeconds, session.Token);
+        var receive = ReceiveLoopAsync(socket, sender, credential, session.Token);
 
         try
         {
@@ -99,20 +100,20 @@ public sealed class AgentWorker(
         await receive.ContinueWith(_ => { }, CancellationToken.None);
     }
 
-    private static async Task HeartbeatLoopAsync(ClientWebSocket socket, int intervalSeconds, CancellationToken ct)
+    private static async Task HeartbeatLoopAsync(MessageSender sender, int intervalSeconds, CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(intervalSeconds));
         while (await timer.WaitForNextTickAsync(ct))
         {
-            await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentHeartbeat
+            await sender.SendAsync((AgentMessage)new AgentHeartbeat
             {
                 SentAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
             }, ct);
         }
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket socket, DeviceCredential credential,
-        CancellationToken ct)
+    private async Task ReceiveLoopAsync(ClientWebSocket socket, MessageSender sender,
+        DeviceCredential credential, CancellationToken ct)
     {
         while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
         {
@@ -120,20 +121,20 @@ public sealed class AgentWorker(
             if (message is null) break;
 
             if (message is ServerJobDispatch dispatch)
-                _ = RunJobAsync(socket, dispatch.Job, credential, ct);
+                _ = RunJobAsync(sender, dispatch.Job, credential, ct);
         }
     }
 
-    private async Task RunJobAsync(ClientWebSocket socket, JobSpec job,
+    private async Task RunJobAsync(MessageSender sender, JobSpec job,
         DeviceCredential credential, CancellationToken ct)
     {
         log.LogInformation("Job {JobId} received", job.JobId);
 
         try
         {
-            await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentJobAccepted { JobId = job.JobId }, ct);
+            await sender.SendAsync((AgentMessage)new AgentJobAccepted { JobId = job.JobId }, ct);
             var result = Attest(await executor.RunAsync(job, ct), job, credential);
-            await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentJobResult { Result = result }, ct);
+            await sender.SendAsync((AgentMessage)new AgentJobResult { Result = result }, ct);
             log.LogInformation("Job {JobId} finished: {State} in {Ms}ms", job.JobId, result.State, result.DurationMs);
         }
         catch (Exception ex)

@@ -617,10 +617,10 @@ function renderJobs(list) {
       <td title="${escapeHtml(absoluteTime(j.createdAt))}">${escapeHtml(relativeTime(j.createdAt))}</td>
       <td><span class="badge ${escapeHtml(j.state)}">${escapeHtml(j.state)}</span></td>
       <td title="${escapeHtml(j.script)}">${escapeHtml((j.script || "").slice(0, 34)) || "—"}</td>
-      <td>${j.exitCode ?? "—"}</td>
-      <td>${j.durationMs != null ? j.durationMs + "ms" : "—"}</td>
-      <td>${j.roundTripMs != null ? j.roundTripMs + "ms" : "—"}</td>
-      <td style="color:var(--muted)">${overhead}</td>
+      <td>${escapeHtml(j.exitCode ?? "—")}</td>
+      <td>${escapeHtml(j.durationMs != null ? j.durationMs + "ms" : "—")}</td>
+      <td>${escapeHtml(j.roundTripMs != null ? j.roundTripMs + "ms" : "—")}</td>
+      <td style="color:var(--muted)">${escapeHtml(overhead)}</td>
     </tr>`;
   }).join("") || '<tr><td colspan="7" class="empty">No jobs match these filters.</td></tr>';
   scroller.scrollTop = scrollTop;
@@ -839,7 +839,7 @@ poll();
 setInterval(poll, 3000);
 </script>
 <script>
-// Frontend contract: docs/investigations-ui-contract.md. No raw-job dispatch
+// Routes: docs/api.md, section 6. No raw-job dispatch
 // belongs here; the backend owns authorization, durable state and execution.
 (() => {
   const states = {

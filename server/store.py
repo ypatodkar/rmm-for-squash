@@ -149,6 +149,10 @@ class Store:
     them safe across the event loop and any worker threads."""
 
     def __init__(self, path: str | Path) -> None:
+        # Applied to investigation text -- errors, events, notes, findings --
+        # before it is stored. Supplied by the AI bridge, which owns the list
+        # of secrets; identity until then.
+        self.redact_text = lambda text: text
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -388,12 +392,15 @@ class Store:
             )
             self._db.commit()
 
-    def job_id_for_idempotency_key(self, key: str) -> str | None:
+    def job_for_idempotency_key(self, key: str) -> dict | None:
+        """The earlier request made under this key, so a reuse can be compared
+        with it rather than trusted to be a retry."""
         with self._lock:
             row = self._db.execute(
-                "SELECT job_id FROM jobs WHERE idempotency_key = ?", (key,)
+                "SELECT job_id, device_id, script, timeout_seconds, created_by"
+                " FROM jobs WHERE idempotency_key = ?", (key,)
             ).fetchone()
-        return row["job_id"] if row else None
+        return dict(row) if row else None
 
     def mark_dispatched(self, job_id: str, at: float) -> None:
         with self._lock:
@@ -553,28 +560,28 @@ class Store:
             self._db.execute(
                 "UPDATE investigations SET finding = ?, confidence = ?, updated_at = ?"
                 " WHERE investigation_id = ?",
-                (finding, confidence, time.time(), investigation_id))
+                (self.redact_text(finding), confidence, time.time(), investigation_id))
             self._db.commit()
 
     def set_investigation_error(self, investigation_id: str, error: str) -> None:
         with self._lock:
             self._db.execute(
                 "UPDATE investigations SET error = ?, updated_at = ? WHERE investigation_id = ?",
-                (error, time.time(), investigation_id))
+                (self.redact_text(error), time.time(), investigation_id))
             self._db.commit()
 
     def set_investigation_outcome(self, investigation_id: str, outcome: dict) -> None:
         with self._lock:
             self._db.execute(
                 "UPDATE investigations SET outcome = ?, updated_at = ? WHERE investigation_id = ?",
-                (json.dumps(outcome), time.time(), investigation_id))
+                (self.redact_text(json.dumps(outcome)), time.time(), investigation_id))
             self._db.commit()
 
     def append_investigation_event(self, investigation_id: str, message: str) -> None:
         with self._lock:
             self._db.execute(
                 "INSERT INTO investigation_events (investigation_id, at, message) VALUES (?,?,?)",
-                (investigation_id, time.time(), message))
+                (investigation_id, time.time(), self.redact_text(message)))
             self._db.commit()
 
     def get_investigation_events(self, investigation_id: str) -> list[dict]:
@@ -593,7 +600,7 @@ class Store:
                 "INSERT INTO investigation_evidence (investigation_id, at, diagnostic,"
                 " arguments, check_succeeded, output, note) VALUES (?,?,?,?,?,?,?)",
                 (investigation_id, time.time(), diagnostic, json.dumps(arguments),
-                 int(check_succeeded), json.dumps(output), note))
+                 int(check_succeeded), json.dumps(output), self.redact_text(note)))
             self._db.commit()
 
     def get_investigation_evidence(self, investigation_id: str) -> list[dict]:

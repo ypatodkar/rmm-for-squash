@@ -44,6 +44,7 @@ try:
     from investigator import Investigator
     from remediation import Applier, Approval, Decision, Planner, Proposal
     from rmm import RmmClient
+    import redaction
     DRIVER_AVAILABLE = True
     _import_error = ""
 except ImportError as error:  # pragma: no cover - exercised only when misdeployed
@@ -61,6 +62,8 @@ _tasks: dict[tuple[str, str], asyncio.Task] = {}
 def configure(the_store) -> None:
     global store
     store = the_store
+    if DRIVER_AVAILABLE:
+        store.redact_text = redaction.redact
 
 
 class DriverUnavailable(RuntimeError):

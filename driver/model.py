@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+from redaction import redact
+
 
 class ModelError(RuntimeError):
     """The provider could not be reached, or refused the request."""
@@ -171,8 +173,11 @@ def load_dotenv(path: str = ".env") -> None:
 
 
 def _provider_message(error: urllib.error.HTTPError) -> str:
+    """The provider's own words are useful for diagnosis, but a rejected
+    request is answered by echoing part of the key it rejected, and this text
+    is stored and shown. It is filtered before it leaves this module."""
     try:
         detail = json.load(error).get("error", {}).get("message", "")
     except Exception:
         detail = ""
-    return f"model provider returned {error.code}: {detail or error.reason}"
+    return redact(f"model provider returned {error.code}: {detail or error.reason}")
