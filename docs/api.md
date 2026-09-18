@@ -6,7 +6,7 @@ This API controls Windows devices, runs scripts, and uses AI for diagnostics. Ev
 
 - **Base URL:** `https://35-173-64-136.sslip.io`
 - **Format:** JSON (camelCase). Times are Unix seconds (except for investigations, which use dates like `2026-09-18T14:02:11Z`).
-- **Authentication:** Humans and scripts use a header: `X-API-Key: <your-key>`. Devices use one-time tokens.
+- **Authentication:** Humans and scripts use `X-API-Key: <your-key>`. A device uses a one-time token only to enroll; afterward it authenticates each connection by signing a server challenge with its private key.
 
 **Setup variables for the examples below:**
 ```bash
@@ -65,8 +65,9 @@ curl -sX POST $HOST/api/enrollment-tokens \
 
 Run this on the endpoint in an Administrator PowerShell to install:
 ```powershell
-iwr https://HOST/install.ps1 -OutFile i.ps1
-.\i.ps1 -Server https://HOST -Token enr_…
+$Server = "https://35-173-64-136.sslip.io"
+iwr "$Server/install.ps1" -OutFile i.ps1
+.\i.ps1 -Server $Server -Token enr_…
 ```
 
 ### Step 2 — The device enrols
@@ -79,7 +80,7 @@ curl -sX POST $HOST/api/enroll -H 'Content-Type: application/json' -d '{
   "publicKey": "MFkwEwYHKoZIzj0CAQ…",
   "hostname": "EC2AMAZ-ABC123",
   "osVersion": "Microsoft Windows Server 2022",
-  "agentVersion": "0.4.0"
+  "agentVersion": "0.2.0"
 }'
 ```
 
@@ -103,7 +104,7 @@ curl -s $HOST/api/devices -H "X-API-Key: $KEY"
   "deviceId": "a1b2c3…",
   "hostname": "EC2AMAZ-ABC123",
   "osVersion": "Microsoft Windows Server 2022",
-  "agentVersion": "0.4.0",
+  "agentVersion": "0.2.0",
   "online": true,
   "secondsSinceLastSeen": 3.2,
   "enrolledAt": 1758140000.0,
@@ -187,7 +188,7 @@ squashctl upgrade WIN-DEMO-1
 
 ## 4. Restarting a Device
 
-Schedule a secure restart. The `reason` must be simple text (no special characters). Minimum delay is 5 seconds.
+Schedule a secure restart. The `reason` accepts a restricted set of ordinary printable characters; command separators and other unsafe characters are rejected. Minimum delay is 5 seconds.
 
 ```bash
 # Default: 15 seconds from now
@@ -315,6 +316,18 @@ curl -s "$HOST/api/audit?limit=50" -H "X-API-Key: $KEY"
 
 Report a problem in plain English. The AI will investigate and propose a fix, but **will never execute it without your approval**.
 
+### Browse investigations
+The list endpoint is paginated. `status` accepts an exact status or one of the groups `active`, `awaiting_approval` and `finished`.
+
+```bash
+curl -s "$HOST/api/investigations?page=1&pageSize=30&status=active" \
+  -H "X-API-Key: $KEY"
+```
+
+```json
+{ "items": [ … ], "page": 1, "totalPages": 1, "total": 2 }
+```
+
 ### Step 1 — Report a problem
 Describe the symptoms the user is seeing, not your guessed cause.
 
@@ -392,6 +405,17 @@ curl -sX POST $HOST/api/investigations/inv-abc123/decision \
         "decision": "approve"
       }'
 ```
+
+Reject with the same body and `"decision": "reject"`.
+
+### Step 4 — Poll for the final result
+The decision endpoint returns immediately. Continue fetching the investigation while an approved repair is `applying` or `verifying`:
+
+```bash
+curl -s $HOST/api/investigations/inv-abc123 -H "X-API-Key: $KEY"
+```
+
+`resolved` means the repair ran and its verification check passed. `unresolved` means the repair or verification did not establish success. `failed` reports an execution error, `rejected` records an operator rejection, and `completed` means the planner found no appropriate automated repair. The final response includes an `outcome` object with the repair and verification job IDs, whether the repair was applied, the verification result, and a human-readable detail.
 
 ---
 
