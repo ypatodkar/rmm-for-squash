@@ -4,7 +4,8 @@
 #   export SQUASH_SERVER=https://35-173-64-136.sslip.io
 #   export SQUASH_KEY=$(cat ~/.squash/operator.key)
 #
-#   squashctl devices
+#   squashctl devices                     the enrolled fleet
+#   squashctl map                         fleet joined to its EC2 instances
 #   squashctl install                     # token + command for a brand-new machine
 #   squashctl upgrade <device-id|host>    # replace the binary remotely, no token, no RDP
 #   squashctl reinstall <device-id|host>  # recovery token, for a machine whose key is gone
@@ -66,6 +67,42 @@ EOF
 }
 
 case "${1:-}" in
+map)
+  # Joins the fleet to its EC2 instances. A Windows hostname is not derived
+  # from the instance id, so the only reliable link is asking each machine for
+  # its own id from the instance metadata service.
+  printf '%-22s %-21s %-16s %s\n' HOSTNAME "INSTANCE ID" "PUBLIC IP" "AWS NAME TAG"
+  printf '%.0s-' {1..86}; printf '\n'
+  # Collected up front rather than piped into the loop: the per-device command
+  # below reads stdin itself and would otherwise swallow the remaining rows.
+  rows=()
+  while IFS= read -r line; do rows+=("$line"); done < <(api GET /api/devices | python3 -c '
+import json, sys
+for d in json.load(sys.stdin):
+    print(d["deviceId"], d["hostname"], sep="\t")')
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r device hostname <<<"$row"
+    # Windows sends CRLF; the carriage return survives into the value and makes
+    # the instance id silently unusable as an argument.
+    instance=$(SQUASH_SERVER="$SERVER" SQUASH_KEY="$KEY" "$0" run "$device" \
+      '(Invoke-RestMethod -Uri "http://169.254.169.254/latest/meta-data/instance-id" -TimeoutSec 5)' \
+      2>/dev/null </dev/null | tail -1 | tr -d '\r[:space:]')
+    if [[ $instance == i-* ]]; then
+      details=$(aws ec2 describe-instances --instance-ids "$instance" \
+        --region "${AWS_REGION:-us-east-1}" \
+        --query 'Reservations[0].Instances[0].[PublicIpAddress,Tags[?Key==`Name`]|[0].Value]' \
+        --output text 2>/dev/null || true)
+      ip=$(printf '%s' "$details" | cut -f1)
+      name=$(printf '%s' "$details" | cut -f2)
+      [[ -n $ip ]] || ip="-"
+      [[ -n $name ]] || name="-"
+    else
+      instance="(offline - could not ask)"; ip="-"; name="-"
+    fi
+    printf '%-22s %-21s %-16s %s\n' "$hostname" "$instance" "$ip" "$name"
+  done
+  ;;
+
 devices)
   api GET /api/devices | python3 -c '
 import json, sys
