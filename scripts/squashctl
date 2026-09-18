@@ -61,6 +61,7 @@ $label
 
 Run in an Administrator PowerShell on the endpoint:
 
+  Set-ExecutionPolicy -Scope Process Bypass -Force
   iwr $SERVER/install.ps1 -OutFile i.ps1
   .\\i.ps1 -Server $SERVER -Token $token
 

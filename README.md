@@ -113,14 +113,15 @@ The agent then connects over `wss://` with ordinary certificate validation.
 ### 5. Mint an enrollment token
 
 ```bash
-export SQUASH_SERVER=http://<host>:5200   # or https://… behind Caddy
+export SQUASH_SERVER=http://<host>:5200   # the address the Windows machine will use, not 127.0.0.1
 export SQUASH_KEY=<your operator key>
 export SQUASH_ALLOW_PLAINTEXT=1           # only if SQUASH_SERVER is http://
 scripts/squashctl install
 ```
 
 This prints a single-use token (valid for one hour) and the exact command to
-run on the endpoint. To mint a token without the CLI:
+run on the endpoint. The command embeds `SQUASH_SERVER`, which is why it must
+be an address the Windows machine can reach. To mint a token without the CLI:
 `curl -X POST -H "X-API-Key: $SQUASH_KEY" $SQUASH_SERVER/api/enrollment-tokens`.
 
 ### 6. Install on Windows
@@ -156,9 +157,10 @@ Or open `http://<host>:5200/` and paste your operator key into the key field.
 
 | Symptom | Cause |
 |---|---|
-| `enrolment has not completed within 45s` | The token expired (1 hour), was already used, or the server can't be reached. On the endpoint, check `Get-EventLog -LogName Application -Source SquashEndpoint -Newest 5` |
+| `enrolment has not completed within 45s` | The token expired (1 hour), was already used, or the server can't be reached. On the endpoint, check `Get-EventLog -LogName Application -Source SquashRmm.Agent -Newest 5` |
 | `Device is already enrolled` (409) | This machine enrolled before and its key is gone. Uninstall it, then run `squashctl reinstall <host>` to get a recovery token for that one device |
 | `Device is revoked` (403) | Run `squashctl restore <host>` first |
+| `iwr` can't connect, or times out | The Windows machine can't reach the control plane. Check that port 5200 (or 443 behind Caddy) accepts inbound connections: the host firewall, and the security group if it's a cloud VM |
 | Device offline right after install | Check that outbound TCP from the endpoint to the control plane's port is allowed |
 
 To remove the agent, run `uninstall.ps1` from the same place. It deletes the

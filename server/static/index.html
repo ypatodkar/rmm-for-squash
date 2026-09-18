@@ -803,7 +803,10 @@ $("enroll").onclick = async () => {
       body: JSON.stringify(body),
     });
     const origin = window.location.origin;
+    // Windows 10/11 refuse to run scripts by default; this lifts that for
+    // this PowerShell window only.
     installCommand =
+      `Set-ExecutionPolicy -Scope Process Bypass -Force\n` +
       `iwr ${origin}/install.ps1 -OutFile i.ps1\n` +
       `.\\i.ps1 -Server ${origin} -Token ${token}`;
     const kind = allowRebind
