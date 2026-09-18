@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import time
+import uuid
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -233,6 +235,21 @@ async def enroll(request: EnrollRequest) -> dict:
             "heartbeatIntervalSeconds": HEARTBEAT_INTERVAL_SECONDS}
 
 
+def uptime_view(row: dict, online: bool) -> dict:
+    """Uptime only advances while we can see the device. An offline machine may
+    be powered off, so its last observation is reported as last known rather
+    than extrapolated forward."""
+    observed = row.get("last_uptime_observed_at")
+    reported = row.get("last_uptime_seconds")
+    if reported is None or observed is None:
+        return {"uptimeSeconds": None, "uptimeIsLastKnown": False, "uptimeObservedAt": None}
+    if online:
+        return {"uptimeSeconds": round(reported + max(0.0, time.time() - observed)),
+                "uptimeIsLastKnown": False, "uptimeObservedAt": observed}
+    return {"uptimeSeconds": round(reported),
+            "uptimeIsLastKnown": True, "uptimeObservedAt": observed}
+
+
 @app.get("/api/devices")
 async def list_devices(operator: str = Depends(require_operator)) -> list[dict]:
     out = []
@@ -249,8 +266,7 @@ async def list_devices(operator: str = Depends(require_operator)) -> list[dict]:
             "lastSeenAt": row["last_seen_at"],
             "revoked": bool(row["revoked"]),
             "lastBootAt": row["last_boot_at"],
-            "uptimeSeconds": round(time.time() - row["last_boot_at"])
-                             if row["last_boot_at"] else None,
+            **uptime_view(row, bool(connection and connection.is_reachable)),
         })
     return out
 
@@ -441,33 +457,122 @@ async def agent_connect(websocket: WebSocket) -> None:
             with contextlib.suppress(Exception):
                 await websocket.close(code=4403, reason="revoked")
     finally:
+        # A reconnect can open a replacement socket before this one finishes
+        # closing. Only the connection still registered for the device may
+        # record it offline, or the older socket's cleanup marks a live
+        # device as gone.
+        superseded = registry.get(device_id) is not connection
         registry.remove(device_id, connection)
-        store.set_disconnected(device_id)
-        store.record_device_event(device_id, "offline", {"reason": "connection closed"})
-        store.audit("device", "disconnect", device_id=device_id)
-        log.info("device %s disconnected", device_id)
+        if superseded:
+            log.info("device %s: stale connection closed, replacement is live", device_id)
+        else:
+            store.set_disconnected(device_id)
+            store.record_device_event(device_id, "offline", {"reason": "connection closed"})
+            store.audit("device", "disconnect", device_id=device_id)
+            log.info("device %s disconnected", device_id)
 
 
 # Boot time is derived from an uptime counter, so successive reports of the same
 # boot differ by a little. Only a gap larger than this is treated as a new boot.
-BOOT_TIME_TOLERANCE_SECONDS = 120.0
-# A machine claiming to have booted in the future, or before this software
-# existed, is reporting a broken clock or lying. Either way the value is not
-# usable, and a far-future value would otherwise poison every later comparison.
+# Reboots are detected from uptime, which comes from a monotonic counter and is
+# therefore unaffected by the endpoint's clock. Boot time is derived from that
+# clock, so it shifts whenever the clock is corrected and cannot be compared
+# reliably; it is kept for display only.
+#
+# Absent a reboot, uptime should grow by at least the elapsed time. A shortfall
+# larger than this means the counter restarted.
+UPTIME_SHORTFALL_TOLERANCE_SECONDS = 120.0
+# Uptime cannot fall within one boot, so any real decrease is a restart
+# regardless of how much time passed. Only measurement jitter is tolerated.
+UPTIME_DECREASE_EPSILON_SECONDS = 5.0
+# Across a control plane restart the monotonic reference is lost and elapsed
+# time falls back to wall clock, which can be adjusted. Require a much larger
+# shortfall there: missing a restart is safer than inventing one.
+UNRELIABLE_ELAPSED_TOLERANCE_SECONDS = 900.0
+
+# Identifies this process, so a stored monotonic reading is only compared
+# against readings from the same process.
+OBSERVER_EPOCH = uuid.uuid4().hex
+MAX_PLAUSIBLE_UPTIME_SECONDS = 20 * 365 * 24 * 3600
 BOOT_TIME_FLOOR = 1_577_836_800.0   # 2020-01-01Z
 BOOT_TIME_FUTURE_SLACK_SECONDS = 300.0
 
 
-def parse_reported_boot_time(value: object) -> float | None:
-    """Endpoint-reported boot time, rejected unless it is plausible."""
+def _finite_number(value: object) -> float | None:
+    """Rejects booleans, non-numerics, NaN, infinities, and integers too large
+    to convert -- each of which otherwise reaches arithmetic and either passes
+    every comparison or raises."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    seconds = value / 1000
-    if seconds < BOOT_TIME_FLOOR:
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
         return None
-    if seconds > time.time() + BOOT_TIME_FUTURE_SLACK_SECONDS:
+    return number if math.isfinite(number) else None
+
+
+def parse_reported_uptime(value: object) -> float | None:
+    seconds = _finite_number(value)
+    if seconds is None or seconds < 0 or seconds > MAX_PLAUSIBLE_UPTIME_SECONDS:
         return None
     return seconds
+
+
+def parse_reported_boot_time(value: object) -> float | None:
+    """Display only. Endpoint clock-derived, so treated as advisory."""
+    milliseconds = _finite_number(value)
+    if milliseconds is None:
+        return None
+    seconds = milliseconds / 1000
+    if seconds < BOOT_TIME_FLOOR or seconds > time.time() + BOOT_TIME_FUTURE_SLACK_SECONDS:
+        return None
+    return seconds
+
+
+def detect_reboot(previous_uptime: float | None, reported_uptime: float | None,
+                  elapsed_seconds: float | None, elapsed_is_reliable: bool = True) -> bool | None:
+    """True if the endpoint restarted since we last saw it, False if it did not,
+    None if we cannot tell.
+
+    Two independent signals, because neither alone is sufficient:
+
+      - Uptime decreasing. Within one boot the counter only rises, so a fall is
+        proof of a restart no matter how little time has passed. This is what
+        catches a machine that reboots twice in quick succession, where the new
+        uptime is small but the shortfall against elapsed time is not.
+      - Uptime rising more slowly than time passed. This catches a restart
+        after a long absence, where the new uptime may still exceed the old.
+
+    `elapsed_seconds` must come from a monotonic source; a wall clock can be
+    adjusted, and an adjustment would otherwise look exactly like a restart.
+    """
+    if reported_uptime is None or previous_uptime is None:
+        return None
+
+    if reported_uptime < previous_uptime - UPTIME_DECREASE_EPSILON_SECONDS:
+        return True
+
+    if elapsed_seconds is None:
+        return False
+
+    tolerance = (UPTIME_SHORTFALL_TOLERANCE_SECONDS if elapsed_is_reliable
+                 else UNRELIABLE_ELAPSED_TOLERANCE_SECONDS)
+    expected = previous_uptime + max(0.0, elapsed_seconds)
+    return reported_uptime < expected - tolerance
+
+
+def elapsed_since_observation(device: dict, monotonic_now: float) -> tuple[float | None, bool]:
+    """Time since this device's uptime was last recorded, and whether that
+    figure can be trusted. Monotonic readings only survive within one process,
+    so after a control plane restart we fall back to the wall clock and say so."""
+    if device.get("last_uptime_observer_epoch") == OBSERVER_EPOCH \
+            and device.get("last_uptime_observed_monotonic") is not None:
+        return max(0.0, monotonic_now - device["last_uptime_observed_monotonic"]), True
+
+    observed_at = device.get("last_uptime_observed_at")
+    if observed_at is None:
+        return None, False
+    return max(0.0, time.time() - observed_at), False
 
 
 def record_connection(device: dict, hello: dict) -> None:
@@ -476,50 +581,44 @@ def record_connection(device: dict, hello: dict) -> None:
     been a network interruption, an agent restart or a control plane restart.
     A later boot time means the endpoint reports having started again."""
     device_id = device["device_id"]
+    now = time.time()
+    monotonic_now = time.monotonic()
+
+    uptime = parse_reported_uptime(hello.get("uptimeSeconds"))
     boot_at = parse_reported_boot_time(hello.get("bootTimeUnixMs"))
 
-    previous_boot = device.get("last_boot_at")
+    # Only meaningful when this control plane saw the device go away. If it was
+    # restarted while the device was gone, it has no disconnect to measure from,
+    # and reporting a number anyway would be an invention.
     unreachable_for = None
     if device.get("last_disconnect_at"):
-        unreachable_for = round(time.time() - device["last_disconnect_at"], 1)
+        unreachable_for = round(max(0.0, now - device["last_disconnect_at"]), 1)
 
-    if boot_at is None:
-        store.record_device_event(device_id, "online",
-                                  {"bootTimeReported": False,
-                                   "secondsUnreachable": unreachable_for})
+    elapsed, elapsed_is_reliable = elapsed_since_observation(device, monotonic_now)
+    rebooted = detect_reboot(device.get("last_uptime_seconds"), uptime,
+                             elapsed, elapsed_is_reliable)
+
+    store.record_uptime(device_id, uptime, boot_at, now, monotonic_now, OBSERVER_EPOCH)
+    store.clear_disconnected(device_id)
+
+    detail = {"secondsUnreachable": unreachable_for, "uptimeSeconds": uptime}
+
+    if rebooted is None:
+        detail["rebootDetermined"] = False
+        detail["reason"] = "no comparable previous observation" if uptime is not None \
+            else "endpoint did not report uptime"
+        store.record_device_event(device_id, "online", detail)
         return
 
-    store.set_boot_time(device_id, boot_at)
-
-    drift = boot_at - previous_boot if previous_boot is not None else None
-
-    # A boot time moving backwards is not a reboot; it means the endpoint's
-    # clock changed. Record it rather than silently treating it as normal.
-    if drift is not None and drift < -BOOT_TIME_TOLERANCE_SECONDS:
-        store.record_device_event(device_id, "boot_time_regressed", {
-            "previousBootAt": previous_boot, "bootAt": boot_at,
-            "secondsUnreachable": unreachable_for,
-        })
-        log.warning("device %s reported an earlier boot time than before", device_id)
-        return
-
-    if drift is not None and drift > BOOT_TIME_TOLERANCE_SECONDS:
-        store.record_device_event(device_id, "rebooted", {
-            "previousBootAt": previous_boot,
-            "bootAt": boot_at,
-            # What the control plane can actually measure: how long the device
-            # was out of contact. Windows may have been down for less.
-            "secondsUnreachable": unreachable_for,
-        })
+    if rebooted:
+        store.record_device_event(device_id, "rebooted", detail)
         store.audit("system", "device.rebooted", device_id=device_id,
                     detail={"secondsUnreachable": unreachable_for})
-        log.info("device %s returned after a new boot (unreachable %ss)",
+        log.info("device %s returned after a restart (unreachable %ss)",
                  device_id, unreachable_for)
     else:
-        store.record_device_event(device_id, "online", {
-            "newBootObserved": False,
-            "secondsUnreachable": unreachable_for,
-        })
+        detail["newBootObserved"] = False
+        store.record_device_event(device_id, "online", detail)
 
 
 def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:

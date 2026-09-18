@@ -156,6 +156,10 @@
         <span class="chip" data-s="Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 Name,CPU | Format-Table -AutoSize | Out-String">top cpu</span>
         <span class="chip" data-s="Get-CimInstance Win32_OperatingSystem | Select-Object LastBootUpTime | Format-List | Out-String">last boot</span>
         <span class="chip" data-s="Start-Sleep -Seconds 60">force timeout</span>
+        <span class="chip" data-s="Get-PSDrive -PSProvider FileSystem | Select-Object Name,@{N='FreeGB';E={[math]::Round($_.Free/1GB,2)}},@{N='PctFree';E={[math]::Round(100*$_.Free/($_.Used+$_.Free),1)}} | Format-Table -AutoSize | Out-String">disk space</span>
+        <span class="chip" data-s="Get-Process | Sort-Object WS -Descending | Select-Object -First 5 Name,@{N='MemoryMB';E={[math]::Round($_.WS/1MB)}} | Format-Table -AutoSize | Out-String">top memory</span>
+        <span class="chip" data-confirm="1"
+              data-s="shutdown.exe /r /t 15 /c &quot;Restart requested from Squash RMM&quot;; &quot;restart scheduled in 15s&quot;">restart machine</span>
       </div>
       <section id="activity" class="activity" data-tone="working" aria-label="Command activity" hidden>
         <div class="activity-head">
@@ -280,7 +284,7 @@ function renderDevices(list) {
       <span>
         <div class="dname">${escapeHtml(d.hostname)}</div>
         <div class="dmeta">${escapeHtml(String(d.osVersion ?? "").slice(0, 28))} · ${escapeHtml(d.secondsSinceLastSeen)}s</div>
-        <div class="dmeta">up ${escapeHtml(formatUptime(d.uptimeSeconds))}</div>
+        <div class="dmeta">${d.uptimeIsLastKnown ? "up (last known) " : "up "}${escapeHtml(formatUptime(d.uptimeSeconds))}</div>
       </span>
     </div>`).join("");
 
@@ -560,8 +564,15 @@ $("run").onclick = async () => {
   finally { finishWatching(); }
 };
 
+// A preset that disrupts the machine is confirmed before it is even loaded
+// into the box, so it cannot be run by a stray click on a familiar row.
 document.querySelectorAll(".chip[data-s]").forEach(c =>
-  c.onclick = () => { $("script").value = c.dataset.s; });
+  c.onclick = () => {
+    const device = deviceNames.get(selected) || selected;
+    if (c.dataset.confirm &&
+        !confirm(`Restart ${device}?\n\nThe machine will go offline and take about a minute to return.`)) return;
+    $("script").value = c.dataset.s;
+  });
 
 let installCommand = "";
 

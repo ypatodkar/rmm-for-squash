@@ -111,6 +111,15 @@ class Store:
                 # claim about that machine rather than as authoritative time.
                 ("last_boot_at", "REAL"),
                 ("last_disconnect_at", "REAL"),
+                # Uptime comes from a monotonic counter, so unlike a derived
+                # boot time it is unaffected by the endpoint's clock. Paired
+                # with the server time at which it was observed.
+                ("last_uptime_seconds", "REAL"),
+                ("last_uptime_observed_at", "REAL"),
+                # Monotonic reading plus the process that took it. Elapsed time
+                # is only trustworthy when both come from the running process.
+                ("last_uptime_observed_monotonic", "REAL"),
+                ("last_uptime_observer_epoch", "TEXT"),
             ],
         }
         for table, columns in additions.items():
@@ -260,10 +269,16 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def set_boot_time(self, device_id: str, boot_at: float) -> None:
+    def record_uptime(self, device_id: str, uptime_seconds: float | None,
+                      boot_at: float | None, observed_at: float,
+                      observed_monotonic: float, observer_epoch: str) -> None:
         with self._lock:
             self._db.execute(
-                "UPDATE devices SET last_boot_at = ? WHERE device_id = ?", (boot_at, device_id))
+                "UPDATE devices SET last_uptime_seconds = ?, last_uptime_observed_at = ?,"
+                " last_uptime_observed_monotonic = ?, last_uptime_observer_epoch = ?,"
+                " last_boot_at = ? WHERE device_id = ?",
+                (uptime_seconds, observed_at, observed_monotonic, observer_epoch,
+                 boot_at, device_id))
             self._db.commit()
 
     def set_disconnected(self, device_id: str) -> None:
@@ -271,6 +286,15 @@ class Store:
             self._db.execute(
                 "UPDATE devices SET last_disconnect_at = ? WHERE device_id = ?",
                 (time.time(), device_id))
+            self._db.commit()
+
+    def clear_disconnected(self, device_id: str) -> None:
+        """Closes a recorded outage. Leaving it set would let a later
+        reconnection measure its duration from a stale timestamp."""
+        with self._lock:
+            self._db.execute(
+                "UPDATE devices SET last_disconnect_at = NULL WHERE device_id = ?",
+                (device_id,))
             self._db.commit()
 
     def touch_device(self, device_id: str) -> None:
