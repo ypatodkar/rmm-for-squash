@@ -287,6 +287,19 @@ is a thing you can get subtly wrong; a whitelist isn't.
 The dashboard makes you type the hostname before it calls this. That's a console
 safeguard, not an API one — the API assumes you already decided.
 
+From the CLI:
+
+```bash
+squashctl restart WIN-DEMO-1                       # prompts for the hostname, 15s
+squashctl reboot  WIN-DEMO-1 --in 120 \
+  --reason 'Monthly patch window (ticket 4821)'
+squashctl restart WIN-DEMO-1 --yes                 # no prompt, for scripts
+```
+
+`restart` and `reboot` are the same command. Without `--yes` it asks you to type
+the device name, and refuses outright if there's no terminal to ask at — so a
+restart can't happen by accident in a pipeline.
+
 ---
 
 ## 5. Running Scripts (Jobs)

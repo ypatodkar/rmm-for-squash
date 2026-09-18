@@ -12,6 +12,7 @@
 #   squashctl revoke <device-id|host>
 #   squashctl restore <device-id|host>
 #   squashctl run <device-id|host> '<powershell>'
+#   squashctl restart <device-id|host> [--in <seconds>] [--reason '<text>'] [--yes]
 set -euo pipefail
 
 SERVER="${SQUASH_SERVER:-}"
@@ -201,8 +202,81 @@ if r["error"]: print("ERROR:", r["error"], file=sys.stderr)
 sys.exit(0 if r["state"] == "Completed" and r["exitCode"] == 0 else 1)'
   ;;
 
+restart|reboot)
+  [[ $# -ge 2 ]] || die "usage: squashctl restart <device-id|hostname> [--in <seconds>] [--reason '<text>'] [--yes]"
+  device=$(resolve "$2")
+  host=$(api GET /api/devices | python3 -c '
+import json, sys
+for d in json.load(sys.stdin):
+    if d["deviceId"] == sys.argv[1]:
+        print(d["hostname"]); break
+else:
+    sys.exit("device vanished between lookup and restart")' "$device")
+
+  delay=15
+  reason="Restart requested from Squash RMM"
+  confirmed=0
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --in)     [[ $# -ge 2 ]] || die "--in needs a number of seconds"; delay=$2; shift 2 ;;
+      --reason) [[ $# -ge 2 ]] || die "--reason needs a message"; reason=$2; shift 2 ;;
+      --yes|-y) confirmed=1; shift ;;
+      *) die "unexpected argument: $1" ;;
+    esac
+  done
+
+  # Typing the name is not ceremony: it makes it impossible to restart the
+  # wrong machine by confirming out of habit after mistyping the target.
+  if [[ $confirmed -ne 1 ]]; then
+    [[ -t 0 ]] || die "no terminal to confirm at. Pass --yes if you mean it."
+    printf 'Restart %s in %ss?\n' "$host" "$delay"
+    printf 'It goes offline for about a minute, and anything unsaved on it is lost.\n'
+    printf 'Type the device name to confirm: '
+    read -r typed
+    lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+    [[ $(lower "$typed") == "$(lower "$host")" ]] \
+      || die "name did not match. Nothing was restarted."
+  fi
+
+  body=$(python3 -c '
+import json, sys
+try:
+    delay = int(sys.argv[1])
+except ValueError:
+    sys.exit("--in must be a whole number of seconds, got %r" % sys.argv[1])
+print(json.dumps({"delaySeconds": delay, "reason": sys.argv[2]}))' "$delay" "$reason")
+
+  job=$(api POST "/api/devices/$device/restart" "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if "jobId" not in d:
+    detail = d.get("detail", d)
+    # FastAPI returns a list of field errors for a schema failure.
+    if isinstance(detail, list):
+        detail = "; ".join(e.get("msg", str(e)) for e in detail)
+    sys.exit("restart refused: %s" % detail)
+if d.get("deduplicated"):
+    print("already requested; showing the original job", file=sys.stderr)
+print(d["jobId"])')
+
+  printf '%s will restart in %ss.\n' "$host" "$delay"
+  # The machine reports back before it goes down; that acknowledgement is the
+  # only evidence the restart was actually scheduled rather than just asked for.
+  api GET "/api/jobs/$job?waitMs=40000" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+print("state %s  exit %s  round-trip %sms" % (r["state"], r["exitCode"], r["roundTripMs"]))
+if r["stdout"]: print(r["stdout"], end="")
+if r["stderr"]: print("STDERR:", r["stderr"], file=sys.stderr)
+if r["error"]: print("ERROR:", r["error"], file=sys.stderr)
+sys.exit(0 if r["state"] == "Completed" and r["exitCode"] == 0 else 1)'
+  ;;
+
 *)
-  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+  # Prints the header comment, whatever length it is, so adding a command
+  # above is enough to document it.
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
   exit 1
   ;;
 esac
