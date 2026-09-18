@@ -19,6 +19,9 @@ import diagnostics
 from diagnostics import ArgumentError
 
 TERMINAL_STATES = {"Completed", "TimedOut", "Unreachable", "Failed"}
+# Floor between polls when the control plane's long-poll returns immediately,
+# so a server that does not hold the connection cannot make this client spin.
+MIN_POLL_INTERVAL_SECONDS = 0.25
 
 
 class RmmError(RuntimeError):
@@ -165,17 +168,29 @@ class RmmClient:
     def _await_terminal(self, job_id: str, deadline_seconds: float) -> dict:
         """Waits for a terminal state or gives up. The control plane's own
         supervisor also forces terminal states, so this deadline guards against
-        the control plane itself being unreachable, not against a hung job."""
+        the control plane itself being unreachable, not against a hung job.
+
+        The long-poll normally blocks server-side. If it returns immediately --
+        an older build, a proxy that does not hold the connection -- this would
+        otherwise spin, so a returning-too-fast response is paced locally.
+        """
         expires_at = time.monotonic() + deadline_seconds
         while True:
             remaining = expires_at - time.monotonic()
             if remaining <= 0:
                 raise RmmError(
                     f"job {job_id} did not reach a terminal state within {deadline_seconds:.0f}s")
+
             wait_ms = int(min(remaining, 15.0) * 1000)
+            asked_at = time.monotonic()
             job = self._request("GET", f"/api/jobs/{job_id}?waitMs={wait_ms}")
             if job["state"] in TERMINAL_STATES:
                 return job
+
+            elapsed = time.monotonic() - asked_at
+            if elapsed < MIN_POLL_INTERVAL_SECONDS:
+                time.sleep(min(MIN_POLL_INTERVAL_SECONDS - elapsed,
+                               max(0.0, expires_at - time.monotonic())))
 
 
 def _parse_json(stdout: str) -> object | None:
