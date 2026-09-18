@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import math
 import os
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -36,6 +38,9 @@ store = Store(DB_PATH)
 registry = DeviceRegistry()
 jobs = JobStore(store)
 OPERATOR_KEYS = auth.load_operator_keys()
+
+import investigations  # noqa: E402  (after `store` exists, which it depends on)
+investigations.configure(store)
 
 
 def require_operator(x_api_key: str | None = Header(default=None)) -> str:
@@ -88,6 +93,9 @@ async def lifespan(_: FastAPI):
     if not OPERATOR_KEYS:
         log.warning("No operator keys configured; the REST API will reject every request.")
     task = asyncio.create_task(supervise())
+    recovered = investigations.recover()
+    if recovered:
+        log.warning("resumed %d interrupted investigation task(s)", len(recovered))
     try:
         yield
     finally:
@@ -707,3 +715,225 @@ async def _receive_loop(websocket: WebSocket, connection: DeviceConnection) -> N
                         detail={"state": state.value, "exitCode": payload.get("exitCode"),
                                 "durationMs": payload.get("durationMs"),
                                 "attested": True})
+
+
+# ==================================================================
+# Investigations -- see docs/investigations-ui-contract.md.
+#
+# The AI driver (diagnosis loop, repair catalogue, approval binding, budget)
+# lives in ../driver and is imported by investigations.py, which owns the
+# background work. These routes only validate, read and write durable state,
+# and schedule that work; none of them execute anything themselves.
+# ==================================================================
+
+def iso(timestamp: float | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.datetime.fromtimestamp(
+        timestamp, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class CreateInvestigationRequest(BaseModel):
+    device_id: str = Field(alias="deviceId", min_length=1)
+    problem: str = Field(min_length=10, max_length=4000)
+    request_id: str = Field(alias="requestId", min_length=1, max_length=128)
+
+    model_config = {"populate_by_name": True}
+
+
+class InvestigationDecisionRequest(BaseModel):
+    proposal_id: str = Field(alias="proposalId")
+    proposal_hash: str = Field(alias="proposalHash")
+    device_id: str = Field(alias="deviceId")
+    decision: Literal["approve", "reject"]
+
+    model_config = {"populate_by_name": True}
+
+
+def investigation_list_view(row: dict) -> dict:
+    return {
+        "investigationId": row["investigation_id"],
+        "deviceId": row["device_id"],
+        "hostname": row["hostname"] or row["device_id"],
+        "problem": row["problem"],
+        "status": row["status"],
+        "createdAt": iso(row["created_at"]),
+    }
+
+
+def proposal_view(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "proposalId": row["proposal_id"],
+        "proposalHash": row["proposal_hash"],
+        "decision": row["decision"],
+        "reasoning": row["reasoning"],
+        "expectedEffect": row["expected_effect"],
+        "risk": row["risk"],
+        "verifiedBy": row["verified_by"],
+        "script": row["script"],
+        "scriptSha256": row["script_sha256"],
+        "refusalReason": row["refusal_reason"],
+        "expiresAt": iso(row["expires_at"]),
+    }
+
+
+def investigation_detail_view(row: dict) -> dict:
+    import json as _json
+    proposal_row = store.get_current_proposal(row["investigation_id"])
+    events = [{"at": iso(e["at"]), "message": e["message"]}
+              for e in store.get_investigation_events(row["investigation_id"])]
+    evidence = [{"diagnostic": e["diagnostic"], "checkSucceeded": bool(e["check_succeeded"]),
+                "output": _json.loads(e["output"]) if e["output"] else None, "note": e["note"]}
+               for e in store.get_investigation_evidence(row["investigation_id"])]
+    return {
+        "investigationId": row["investigation_id"],
+        "deviceId": row["device_id"],
+        "hostname": row["hostname"] or row["device_id"],
+        "problem": row["problem"],
+        "status": row["status"],
+        "createdAt": iso(row["created_at"]),
+        "events": events,
+        "finding": row["finding"],
+        "confidence": row["confidence"],
+        "evidence": evidence,
+        "proposal": proposal_view(proposal_row) if row["status"] != "queued" else None,
+        "outcome": _json.loads(row["outcome"]) if row["outcome"] else None,
+        "error": row["error"],
+    }
+
+
+@app.get("/api/investigations")
+async def list_investigations(
+    page: int = Query(default=1, ge=1),
+    pageSize: int = Query(default=30, ge=1, le=100),
+    search: str = Query(default="", max_length=500),
+    status: str | None = None,
+    operator: str = Depends(require_operator),
+) -> dict:
+    result = store.list_investigations(page, pageSize, search=search, status=status)
+    return {"items": [investigation_list_view(r) for r in result["items"]],
+            "page": result["page"], "totalPages": result["totalPages"], "total": result["total"]}
+
+
+@app.post("/api/investigations", status_code=202)
+async def create_investigation(request: CreateInvestigationRequest,
+                               operator: str = Depends(require_operator)) -> dict:
+    device = store.get_device(request.device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail=f"Device '{request.device_id}' is not enrolled.")
+    if device["revoked"]:
+        raise HTTPException(status_code=403, detail="Device is revoked.")
+
+    problem = request.problem.strip()
+    if not (10 <= len(problem) <= 4000):
+        raise HTTPException(status_code=400,
+                            detail="Problem description must be 10-4000 characters.")
+
+    investigation_id = "inv-" + uuid.uuid4().hex[:20]
+    row, created = store.create_investigation(
+        investigation_id, request.device_id, problem, operator, request.request_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Could not create the investigation.")
+
+    if not created:
+        if row["device_id"] != request.device_id or row["problem"] != problem:
+            raise HTTPException(
+                status_code=409,
+                detail="This request ID was already used for a different investigation.")
+        return {"investigationId": row["investigation_id"]}
+
+    store.append_investigation_event(row["investigation_id"], f"Request received for {device['hostname']}.")
+    store.audit(operator, "investigation.create", device_id=request.device_id,
+                detail={"investigationId": row["investigation_id"]})
+
+    if investigations.DRIVER_AVAILABLE:
+        investigations.schedule_start(row["investigation_id"])
+    else:
+        store.set_investigation_error(row["investigation_id"], "AI driver is not deployed on this control plane.")
+        store.set_investigation_status(row["investigation_id"], "failed")
+
+    return {"investigationId": row["investigation_id"]}
+
+
+@app.get("/api/investigations/{investigation_id}")
+async def get_investigation(investigation_id: str,
+                            operator: str = Depends(require_operator)) -> dict:
+    row = store.get_investigation(investigation_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown investigation.")
+    return investigation_detail_view(row)
+
+
+@app.post("/api/investigations/{investigation_id}/decision")
+async def decide_investigation(investigation_id: str, request: InvestigationDecisionRequest,
+                               operator: str = Depends(require_operator)) -> dict:
+    inv = store.get_investigation(investigation_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Unknown investigation.")
+
+    proposal = store.get_current_proposal(investigation_id)
+    if proposal is None or proposal["decision"] != "proposed":
+        raise HTTPException(status_code=409,
+                            detail="This investigation has no actionable proposal.")
+
+    binding_matches = (proposal["proposal_id"] == request.proposal_id
+                       and proposal["proposal_hash"] == request.proposal_hash
+                       and inv["device_id"] == request.device_id
+                       and investigations.proposal_hash_matches(
+                           investigation_id, inv["device_id"], proposal))
+    if not binding_matches:
+        raise HTTPException(
+            status_code=409,
+            detail="The proposal has changed since you last saw it. Refresh and try again.")
+
+    if proposal["decided_at"] is not None:
+        # Already decided, by this request or a concurrent one. Identical
+        # decisions are idempotent; a different one is a genuine conflict.
+        if proposal["decision_outcome"] == request.decision:
+            # Also heals the tiny crash window between recording approval and
+            # scheduling the durable work. The scheduler deduplicates a task
+            # already running in this process.
+            if request.decision == "approve" and inv["status"] == "awaiting_approval":
+                store.set_investigation_status(investigation_id, "applying")
+                investigations.schedule_apply(investigation_id)
+            elif request.decision == "reject" and inv["status"] == "awaiting_approval":
+                store.set_investigation_status(investigation_id, "rejected")
+            return investigation_detail_view(store.get_investigation(investigation_id))
+        raise HTTPException(status_code=409, detail="A different decision was already recorded.")
+
+    if inv["status"] != "awaiting_approval":
+        raise HTTPException(status_code=409, detail="This proposal is no longer awaiting a decision.")
+
+    if request.decision == "approve" and (
+            proposal["expires_at"] is None or time.time() >= proposal["expires_at"]):
+        raise HTTPException(status_code=409, detail="This proposal has expired.")
+
+    # Compare-and-set: only the first decision for this proposal is recorded.
+    decided, recorded = store.record_proposal_decision(
+        proposal["proposal_id"], operator, request.decision)
+    if decided is None or decided["decision_outcome"] != request.decision:
+        raise HTTPException(status_code=409,
+                            detail="A different decision was already recorded.")
+    if not recorded:
+        # A concurrent identical request won the compare-and-set. It owns the
+        # status transition and scheduling; this request is only a read retry.
+        return investigation_detail_view(store.get_investigation(investigation_id))
+
+    store.audit(operator, f"investigation.{request.decision}", device_id=inv["device_id"],
+                detail={"investigationId": investigation_id, "proposalId": proposal["proposal_id"]})
+
+    if request.decision == "reject":
+        store.set_investigation_status(investigation_id, "rejected")
+        store.append_investigation_event(investigation_id, "Operator rejected the proposed fix.")
+    else:
+        store.set_investigation_status(investigation_id, "applying")
+        store.append_investigation_event(investigation_id, "Operator approved the proposed fix.")
+        if investigations.DRIVER_AVAILABLE:
+            investigations.schedule_apply(investigation_id)
+        else:
+            store.set_investigation_error(investigation_id, "AI driver is not deployed on this control plane.")
+            store.set_investigation_status(investigation_id, "failed")
+
+    return investigation_detail_view(store.get_investigation(investigation_id))

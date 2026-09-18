@@ -79,6 +79,68 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at DESC);
+
+CREATE TABLE IF NOT EXISTS investigations (
+    investigation_id TEXT PRIMARY KEY,
+    device_id        TEXT NOT NULL,
+    problem          TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    finding          TEXT,
+    confidence       TEXT,
+    error            TEXT,
+    outcome          TEXT,
+    created_by       TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL
+);
+-- One request from one operator creates at most one investigation, so a
+-- retried submission after an ambiguous network failure cannot double-run it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_investigations_dedup
+    ON investigations(created_by, request_id);
+CREATE INDEX IF NOT EXISTS idx_investigations_created ON investigations(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS investigation_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    investigation_id TEXT NOT NULL,
+    at               REAL NOT NULL,
+    message          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_events ON investigation_events(investigation_id, at);
+
+CREATE TABLE IF NOT EXISTS investigation_evidence (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    investigation_id TEXT NOT NULL,
+    at               REAL NOT NULL,
+    diagnostic       TEXT NOT NULL,
+    arguments        TEXT,
+    check_succeeded  INTEGER NOT NULL,
+    output           TEXT,
+    note             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inv_evidence ON investigation_evidence(investigation_id, at);
+
+CREATE TABLE IF NOT EXISTS investigation_proposals (
+    proposal_id       TEXT PRIMARY KEY,
+    investigation_id  TEXT NOT NULL,
+    decision          TEXT NOT NULL,
+    repair            TEXT,
+    arguments         TEXT,
+    script            TEXT,
+    script_sha256     TEXT,
+    reasoning         TEXT,
+    expected_effect   TEXT,
+    risk              TEXT,
+    verified_by       TEXT,
+    refusal_reason    TEXT,
+    proposal_hash     TEXT,
+    created_at        REAL NOT NULL,
+    expires_at        REAL,
+    decided_at        REAL,
+    decided_by        TEXT,
+    decision_outcome  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inv_proposals ON investigation_proposals(investigation_id, created_at DESC);
 """
 
 
@@ -407,3 +469,257 @@ class Store:
                 " WHERE state IN ('Queued','Dispatched','Running')", (time.time(),)
             )
             self._db.commit()
+
+    # ---------- investigations ----------
+
+    def create_investigation(self, investigation_id: str, device_id: str, problem: str,
+                             created_by: str, request_id: str) -> tuple[dict | None, bool]:
+        """Atomically deduplicates by (created_by, request_id): a retried
+        submission after an ambiguous network failure returns the row that
+        already exists rather than creating a second investigation. Returns
+        (row, created) -- created is False when an existing row was returned."""
+        now = time.time()
+        with self._lock:
+            try:
+                self._db.execute(
+                    "INSERT INTO investigations (investigation_id, device_id, problem, status,"
+                    " created_by, request_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (investigation_id, device_id, problem, "queued", created_by, request_id,
+                     now, now),
+                )
+                self._db.commit()
+                created = True
+            except sqlite3.IntegrityError:
+                created = False
+
+            row = self._db.execute(
+                "SELECT i.*, d.hostname AS hostname FROM investigations i"
+                " LEFT JOIN devices d ON d.device_id = i.device_id"
+                " WHERE i.created_by = ? AND i.request_id = ?",
+                (created_by, request_id),
+            ).fetchone()
+        return (dict(row) if row else None), created
+
+    def get_investigation(self, investigation_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT i.*, d.hostname AS hostname FROM investigations i"
+                " LEFT JOIN devices d ON d.device_id = i.device_id"
+                " WHERE i.investigation_id = ?", (investigation_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    _STATUS_GROUPS = {
+        "active": ("queued", "investigating", "planning", "applying", "verifying"),
+        "awaiting_approval": ("awaiting_approval",),
+        "finished": ("completed", "resolved", "unresolved", "failed", "rejected", "cancelled"),
+    }
+
+    def list_investigations(self, page: int, page_size: int, *, search: str = "",
+                            status: str | None = None) -> dict:
+        clauses, params = [], []
+        if status:
+            statuses = self._STATUS_GROUPS.get(status, (status,))
+            clauses.append(f"i.status IN ({','.join('?' * len(statuses))})")
+            params.extend(statuses)
+        if search.strip():
+            clauses.append("(instr(lower(i.problem), lower(?)) > 0"
+                           " OR instr(lower(coalesce(d.hostname,'')), lower(?)) > 0)")
+            params.extend([search.strip(), search.strip()])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        base = ("FROM investigations i LEFT JOIN devices d ON d.device_id = i.device_id" + where)
+        with self._lock:
+            total = self._db.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = min(max(1, page), total_pages)
+            rows = self._db.execute(
+                f"SELECT i.*, d.hostname AS hostname {base}"
+                " ORDER BY i.created_at DESC, i.investigation_id DESC LIMIT ? OFFSET ?",
+                [*params, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": total, "page": page,
+                "totalPages": total_pages}
+
+    def set_investigation_status(self, investigation_id: str, status: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE investigations SET status = ?, updated_at = ? WHERE investigation_id = ?",
+                (status, time.time(), investigation_id))
+            self._db.commit()
+
+    def set_investigation_finding(self, investigation_id: str, finding: str,
+                                  confidence: str | None) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE investigations SET finding = ?, confidence = ?, updated_at = ?"
+                " WHERE investigation_id = ?",
+                (finding, confidence, time.time(), investigation_id))
+            self._db.commit()
+
+    def set_investigation_error(self, investigation_id: str, error: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE investigations SET error = ?, updated_at = ? WHERE investigation_id = ?",
+                (error, time.time(), investigation_id))
+            self._db.commit()
+
+    def set_investigation_outcome(self, investigation_id: str, outcome: dict) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE investigations SET outcome = ?, updated_at = ? WHERE investigation_id = ?",
+                (json.dumps(outcome), time.time(), investigation_id))
+            self._db.commit()
+
+    def append_investigation_event(self, investigation_id: str, message: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO investigation_events (investigation_id, at, message) VALUES (?,?,?)",
+                (investigation_id, time.time(), message))
+            self._db.commit()
+
+    def get_investigation_events(self, investigation_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT at, message FROM investigation_events"
+                " WHERE investigation_id = ? ORDER BY at, id", (investigation_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_investigation_evidence(self, investigation_id: str, diagnostic: str,
+                                      arguments: dict, check_succeeded: bool,
+                                      output: object, note: str | None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO investigation_evidence (investigation_id, at, diagnostic,"
+                " arguments, check_succeeded, output, note) VALUES (?,?,?,?,?,?,?)",
+                (investigation_id, time.time(), diagnostic, json.dumps(arguments),
+                 int(check_succeeded), json.dumps(output), note))
+            self._db.commit()
+
+    def get_investigation_evidence(self, investigation_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT diagnostic, arguments, check_succeeded, output, note"
+                " FROM investigation_evidence WHERE investigation_id = ? ORDER BY at, id",
+                (investigation_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_proposal(self, proposal_id: str, investigation_id: str, *, decision: str,
+                        repair: str | None, arguments: dict, script: str | None,
+                        script_sha256: str | None, reasoning: str, expected_effect: str,
+                        risk: str, verified_by: str, refusal_reason: str,
+                        proposal_hash: str | None, expires_at: float | None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO investigation_proposals (proposal_id, investigation_id, decision,"
+                " repair, arguments, script, script_sha256, reasoning, expected_effect, risk,"
+                " verified_by, refusal_reason, proposal_hash, created_at, expires_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (proposal_id, investigation_id, decision, repair, json.dumps(arguments), script,
+                 script_sha256, reasoning, expected_effect, risk, verified_by, refusal_reason,
+                 proposal_hash, time.time(), expires_at))
+            self._db.commit()
+
+    def get_current_proposal(self, investigation_id: str) -> dict | None:
+        """One planning pass per investigation in this version, so the most
+        recent proposal is the only one that can be current."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM investigation_proposals WHERE investigation_id = ?"
+                " ORDER BY created_at DESC LIMIT 1", (investigation_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_proposal_decision(self, proposal_id: str, decided_by: str,
+                                 decision_outcome: str) -> tuple[dict | None, bool]:
+        """Compare-and-set: only the first decision is recorded. The caller
+        receives whether this call won the update, so an idempotent HTTP retry
+        cannot schedule the same background work a second time."""
+        now = time.time()
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE investigation_proposals SET decided_at = ?, decided_by = ?,"
+                " decision_outcome = ? WHERE proposal_id = ? AND decided_at IS NULL",
+                (now, decided_by, decision_outcome, proposal_id))
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM investigation_proposals WHERE proposal_id = ?", (proposal_id,)
+            ).fetchone()
+        return (dict(row) if row else None), cursor.rowcount == 1
+
+    def recover_investigations(self) -> list[tuple[str, str]]:
+        """Makes interrupted background work runnable after a server restart.
+
+        Diagnosis is read-only, so an interrupted diagnosis can safely restart
+        from a clean evidence/proposal snapshot. An approved repair is resumed
+        with the same proposal id; the repair dispatcher uses that id as its
+        idempotency key, so a lost response cannot execute it twice.
+
+        Returns ``(investigation_id, work_kind)`` where work_kind is ``start``
+        or ``apply``. Investigations waiting for a human remain untouched.
+        """
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT i.investigation_id, i.status,"
+                " (SELECT p.decision_outcome FROM investigation_proposals p"
+                "  WHERE p.investigation_id=i.investigation_id"
+                "  ORDER BY p.created_at DESC LIMIT 1) AS decision_outcome"
+                " FROM investigations i"
+                " WHERE i.status IN ('queued','investigating','planning',"
+                " 'awaiting_approval','applying','verifying')"
+            ).fetchall()
+            work: list[tuple[str, str]] = []
+            now = time.time()
+            for row in rows:
+                investigation_id = row["investigation_id"]
+                status = row["status"]
+                decision = row["decision_outcome"]
+                if status in ("queued", "investigating", "planning"):
+                    if status != "queued":
+                        self._db.execute(
+                            "DELETE FROM investigation_evidence WHERE investigation_id=?",
+                            (investigation_id,))
+                        self._db.execute(
+                            "DELETE FROM investigation_proposals WHERE investigation_id=?"
+                            " AND decided_at IS NULL", (investigation_id,))
+                        self._db.execute(
+                            "UPDATE investigations SET status='queued', finding=NULL,"
+                            " confidence=NULL, error=NULL, outcome=NULL, updated_at=?"
+                            " WHERE investigation_id=?", (now, investigation_id))
+                        self._db.execute(
+                            "INSERT INTO investigation_events (investigation_id, at, message)"
+                            " VALUES (?,?,?)", (investigation_id, now,
+                            "Control plane restarted; restarting the read-only diagnosis."))
+                    work.append((investigation_id, "start"))
+                elif decision == "approve":
+                    self._db.execute(
+                        "UPDATE investigations SET status='applying', updated_at=?"
+                        " WHERE investigation_id=?", (now, investigation_id))
+                    self._db.execute(
+                        "INSERT INTO investigation_events (investigation_id, at, message)"
+                        " VALUES (?,?,?)", (investigation_id, now,
+                        "Control plane restarted; resuming the approved repair."))
+                    work.append((investigation_id, "apply"))
+                elif decision == "reject":
+                    self._db.execute(
+                        "UPDATE investigations SET status='rejected', updated_at=?"
+                        " WHERE investigation_id=?", (now, investigation_id))
+                elif status in ("applying", "verifying"):
+                    self._db.execute(
+                        "UPDATE investigations SET status='failed', error=?, updated_at=?"
+                        " WHERE investigation_id=?",
+                        ("Repair state could not be recovered because its approval is missing.",
+                         now, investigation_id))
+            self._db.commit()
+        return work
+
+    def claim_queued_investigation(self, investigation_id: str) -> bool:
+        """Only one worker may move a queued investigation into diagnosis."""
+        with self._lock:
+            cursor = self._db.execute(
+                "UPDATE investigations SET status='investigating', updated_at=?"
+                " WHERE investigation_id=? AND status='queued'",
+                (time.time(), investigation_id))
+            self._db.commit()
+        return cursor.rowcount == 1

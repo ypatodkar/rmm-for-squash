@@ -1,15 +1,16 @@
-# Investigations UI handoff
+# Investigations UI and API contract
 
 The frontend lives in `server/static/index.html`, under `#investigations`.
-`#devices` retains device enrollment, manual PowerShell and job history.
-No server or driver implementation is included in this frontend change.
+`#devices` retains device enrollment, manual PowerShell and job history. The
+routes below are implemented in `server/main.py`; durable workflow state lives
+in SQLite through `server/store.py`, and `server/investigations.py` connects it
+to the tested driver components.
 
-Until the routes below exist, the page keeps submission disabled, allows a
-request draft, and offers a clearly labelled, non-executable example preview.
-There are no simulated live requests or direct PowerShell dispatches from this
-page. The API uses the dashboard's existing `X-API-Key` authentication.
+There are no simulated live requests or direct PowerShell dispatches from the
+investigations page. The API uses the dashboard's existing `X-API-Key`
+authentication. The example preview is labelled and cannot execute anything.
 
-## Routes to implement
+## Routes
 
 - `GET /api/investigations?page=1&pageSize=30&search=...&status=...`
   returns `{ "items": [...], "page": 1, "totalPages": 1, "total": 0 }`.
@@ -103,3 +104,27 @@ browser restart; after a reload, consult request history before resubmitting.
 The preview is explicit fixture data and never sends commands or decisions.
 Only actual backend status/events animate the live progress indicator. Endpoint
 and model output is rendered as text (no HTML/Markdown execution).
+
+## Runtime configuration
+
+The control plane and AI driver run in one Python process for this demo, while
+the driver still calls the control plane through its authenticated public API.
+Set these variables in the service environment before starting Uvicorn:
+
+```sh
+SQUASH_OPERATOR_KEYS="operator:<dashboard-key>,ai-driver:<driver-key>"
+SQUASH_DRIVER_KEY="<driver-key>"
+SQUASH_SELF_URL="http://127.0.0.1:5200"
+OPENAI_API_KEY="<model-provider-key>"
+SQUASH_MODEL="gpt-4.1"
+```
+
+`SQUASH_DRIVER_KEY` must be the `ai-driver` entry in
+`SQUASH_OPERATOR_KEYS`; this gives every diagnostic and repair dispatch an
+auditable actor distinct from the person using the dashboard. The loopback
+HTTP URL is allowed because the credential never leaves the host. Use HTTPS if
+the worker and control plane run on different hosts.
+
+On startup, queued/read-only investigations resume. Interrupted approved
+repairs resume under the same proposal id and therefore the same job
+idempotency key. Investigations waiting for human approval remain paused.
