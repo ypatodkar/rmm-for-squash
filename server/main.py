@@ -59,6 +59,18 @@ class DispatchRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class RestartRequest(BaseModel):
+    """The delay has a floor because the machine has to stay up long enough to
+    report the result of its own restart; see protocol.restart_script."""
+    delay_seconds: int = Field(default=15, alias="delaySeconds",
+                               ge=protocol.MIN_RESTART_DELAY_SECONDS,
+                               le=protocol.MAX_RESTART_DELAY_SECONDS)
+    reason: str = Field(default=protocol.DEFAULT_RESTART_REASON, max_length=200)
+    idempotency_key: str | None = Field(default=None, alias="idempotencyKey")
+
+    model_config = {"populate_by_name": True}
+
+
 class EnrollRequest(BaseModel):
     token: str
     device_id: str = Field(alias="deviceId")
@@ -348,11 +360,18 @@ async def list_audit(limit: int = 100, operator: str = Depends(require_operator)
     return store.recent_audit(limit)
 
 
-@app.post("/api/devices/{device_id}/jobs", status_code=202)
-async def dispatch(device_id: str, request: DispatchRequest,
-                   operator: str = Depends(require_operator)) -> dict:
-    if request.idempotency_key:
-        existing = store.job_id_for_idempotency_key(request.idempotency_key)
+async def send_to_device(device_id: str, script: str, *, timeout_seconds: int,
+                         max_output_bytes: int, operator: str,
+                         idempotency_key: str | None, action: str,
+                         detail: dict) -> dict:
+    """The one path from an operator request to a script on an endpoint.
+
+    Every route that runs something goes through here, so the checks that
+    matter -- deduplication, enrolment, revocation, reachability -- cannot be
+    skipped by adding a new route that forgets one of them.
+    """
+    if idempotency_key:
+        existing = store.job_id_for_idempotency_key(idempotency_key)
         if existing:
             return {"jobId": existing, "state": "Duplicate", "deduplicated": True}
 
@@ -366,17 +385,63 @@ async def dispatch(device_id: str, request: DispatchRequest,
     if connection is None or not connection.is_reachable:
         raise HTTPException(status_code=409, detail=f"Device '{device_id}' is not reachable.")
 
-    job = jobs.create(device_id, request.script, request.timeout_seconds,
-                      request.max_output_bytes, operator, request.idempotency_key)
+    job = jobs.create(device_id, script, timeout_seconds, max_output_bytes,
+                      operator, idempotency_key)
     jobs.mark_dispatched(job)
-    store.audit(operator, "job.dispatch", device_id=device_id, job_id=job.job_id,
-                detail={"scriptBytes": len(request.script),
-                        "timeoutSeconds": request.timeout_seconds})
+    store.audit(operator, action, device_id=device_id, job_id=job.job_id, detail=detail)
 
     await connection.outbound.put(
         job_dispatch(job.job_id, job.script, job.timeout_seconds, job.max_output_bytes)
     )
     return {"jobId": job.job_id, "state": job.state.value}
+
+
+@app.post("/api/devices/{device_id}/jobs", status_code=202)
+async def dispatch(device_id: str, request: DispatchRequest,
+                   operator: str = Depends(require_operator)) -> dict:
+    return await send_to_device(
+        device_id, request.script,
+        timeout_seconds=request.timeout_seconds,
+        max_output_bytes=request.max_output_bytes,
+        operator=operator, idempotency_key=request.idempotency_key,
+        action="job.dispatch",
+        detail={"scriptBytes": len(request.script),
+                "timeoutSeconds": request.timeout_seconds})
+
+
+@app.post("/api/devices/{device_id}/restart", status_code=202)
+async def restart_device(device_id: str, request: RestartRequest | None = None,
+                         operator: str = Depends(require_operator)) -> dict:
+    """Restarting has its own route rather than being a script an operator is
+    expected to know, because it is the one destructive thing in this API and
+    it should be legible in the audit log as itself.
+
+    It still becomes an ordinary job: the same dispatch path, the same
+    attested result, the same history. What the route adds is that the caller
+    cannot get the command wrong, and cannot smuggle anything else in beside
+    it -- the only things it supplies are a delay and a message.
+    """
+    request = request or RestartRequest()
+    try:
+        script = protocol.restart_script(request.delay_seconds, request.reason)
+    except protocol.RestartError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+    result = await send_to_device(
+        device_id, script,
+        # shutdown.exe schedules the restart and returns at once; it does
+        # not block for the delay, so this is an ordinary short job.
+        timeout_seconds=30, max_output_bytes=4096,
+        operator=operator, idempotency_key=request.idempotency_key,
+        action="device.restart",
+        detail={"delaySeconds": request.delay_seconds, "reason": request.reason})
+
+    if not result.get("deduplicated"):
+        store.record_device_event(device_id, "restart_requested",
+                                  {"operator": operator,
+                                   "delaySeconds": request.delay_seconds})
+    return {**result, "restartAt": time.time() + request.delay_seconds,
+            "delaySeconds": request.delay_seconds}
 
 
 @app.get("/api/jobs/{job_id}")

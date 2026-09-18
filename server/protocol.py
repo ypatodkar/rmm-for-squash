@@ -7,6 +7,7 @@ JsonSerializerDefaults.Web. Do not rename without changing the agent.
 from __future__ import annotations
 
 import hashlib
+import re
 from enum import Enum
 from typing import Any
 
@@ -101,3 +102,43 @@ def hello_ack(device_id: str, heartbeat_interval_seconds: int) -> dict:
         "deviceId": device_id,
         "heartbeatIntervalSeconds": heartbeat_interval_seconds,
     }
+
+
+# ---------- restart ----------
+
+DEFAULT_RESTART_REASON = "Restart requested from Squash RMM"
+MIN_RESTART_DELAY_SECONDS = 5
+MAX_RESTART_DELAY_SECONDS = 3600
+
+# The reason is shown to whoever is sitting at the machine, and it is
+# substituted into a command line. The character class is narrow on purpose:
+# anything that could close the quote or start a new statement is refused
+# rather than escaped, because escaping is a thing you can get subtly wrong
+# and a whitelist is a thing you cannot.
+_RESTART_REASON = re.compile(r"^[A-Za-z0-9 .,:!?'\-_()/]{1,200}$")
+
+
+class RestartError(ValueError):
+    """The requested restart is not one we are willing to build."""
+
+
+def restart_script(delay_seconds: int, reason: str) -> str:
+    """Builds the restart command.
+
+    The delay is not decoration. The agent has to report the job result over
+    the same machine that is about to go down, so a restart that begins
+    immediately shows up to the operator as a failed job for an action that
+    actually succeeded.
+    """
+    if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int):
+        raise RestartError("delaySeconds must be a whole number of seconds")
+    if not MIN_RESTART_DELAY_SECONDS <= delay_seconds <= MAX_RESTART_DELAY_SECONDS:
+        raise RestartError(
+            f"delaySeconds must be between {MIN_RESTART_DELAY_SECONDS} and "
+            f"{MAX_RESTART_DELAY_SECONDS}")
+    if not isinstance(reason, str) or not _RESTART_REASON.match(reason):
+        raise RestartError(
+            "reason may contain only letters, digits, spaces and . , : ! ? ' - _ ( ) / "
+            "(1-200 characters)")
+    return (f'shutdown.exe /r /t {delay_seconds} /c "{reason}"; '
+            f'"restart scheduled in {delay_seconds}s"')

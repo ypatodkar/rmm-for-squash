@@ -759,10 +759,30 @@ $("restart-device").onclick = async () => {
     $("restart-note").textContent = "Name did not match. Nothing was restarted.";
     return;
   }
+  if (commandBusy) return;
+  commandBusy = true;
+  updateRunButton();
   $("restart-note").textContent = `Restart requested on ${hostname}.`;
-  $("script").value =
-    'shutdown.exe /r /t 15 /c "Restart requested from Squash RMM"; "restart scheduled in 15s"';
-  $("run").click();
+  const run = beginActivity(selected);
+  $("output").textContent = "Waiting for the command result…";
+  $("timing").textContent = "";
+  try {
+    // The console does not compose the shutdown command itself. It asks for a
+    // restart and the control plane decides what that means, so there is one
+    // definition of it and the audit log records it as a restart rather than
+    // as some script that happened to contain the word.
+    const dispatched = await api(`/api/devices/${encodeURIComponent(run.deviceId)}/restart`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delaySeconds: 15 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    run.jobId = dispatched.jobId;
+    $("activity-context").textContent = `${run.deviceName} · Job ${run.jobId}`;
+    showJobActivity(run, dispatched);
+    await watchCommand(run);
+  } catch (error) { pauseActivity(run, error); }
+  finally { finishWatching(); }
 };
 
 let installCommand = "";
