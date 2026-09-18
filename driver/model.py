@@ -52,13 +52,19 @@ class OpenAIModel(Model):
     ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
     def __init__(self, api_key: str, model: str = "gpt-4.1", *,
-                 timeout: float = 60.0, temperature: float = 0.0) -> None:
+                 timeout: float = 60.0, temperature: float = 0.0,
+                 one_check_at_a_time: bool = True) -> None:
         if not api_key:
             raise ModelError("no API key configured")
         self._key = api_key
         self.name = model
         self._timeout = timeout
         self._temperature = temperature
+        # Left to itself the model requests several checks at once, which
+        # commits it before it has seen any evidence. Restricting it to one
+        # call per turn is what makes each check a decision informed by the
+        # last -- and it is the behaviour the latency requirement describes.
+        self._one_check_at_a_time = one_check_at_a_time
 
     def respond(self, messages: list[dict], tools: list[dict]) -> ModelReply:
         payload = {
@@ -69,6 +75,8 @@ class OpenAIModel(Model):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+            if self._one_check_at_a_time:
+                payload["parallel_tool_calls"] = False
 
         request = urllib.request.Request(
             self.ENDPOINT,
@@ -141,7 +149,9 @@ def from_environment() -> Model:
         key = os.environ.get("OPEN_AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
         if not key:
             raise ModelError("set OPEN_AI_API_KEY (or OPENAI_API_KEY)")
-        return OpenAIModel(key, os.environ.get("SQUASH_MODEL", "gpt-4.1"))
+        return OpenAIModel(
+            key, os.environ.get("SQUASH_MODEL", "gpt-4.1"),
+            one_check_at_a_time=os.environ.get("SQUASH_PARALLEL_CHECKS", "0") != "1")
     raise ModelError(f"unsupported model provider: {provider!r}")
 
 
