@@ -10,3 +10,10 @@ appsettings.Local.json
 *.db
 *.db-shm
 *.db-wal
+
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
