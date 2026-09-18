@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Plants a real fault on an endpoint so the RMM has to find it.
+#
+# Faults are planted over AWS SSM, deliberately not through this RMM: the
+# investigation has to discover the problem from evidence rather than being
+# handed it. Each one is a service the machine genuinely needs, stopped the
+# way it would stop on its own.
+#
+#   scripts/plant-fault status            what is currently broken
+#   scripts/plant-fault printing          stop the print spooler
+#   scripts/plant-fault clock             stop the Windows time service
+#   scripts/plant-fault display           stop the themes service
+#   scripts/plant-fault reset             put everything back
+#
+#   SQUASH_EVAL_INSTANCE   EC2 instance id of the endpoint (default below)
+set -euo pipefail
+
+INSTANCE="${SQUASH_EVAL_INSTANCE:-i-04808f091a04182f2}"
+REGION="${AWS_REGION:-us-east-1}"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+run_on_endpoint() {
+  local script=$1
+  local command_id
+  command_id=$(aws ssm send-command --instance-ids "$INSTANCE" \
+    --document-name AWS-RunPowerShellScript \
+    --parameters "$(python3 -c 'import json,sys;print(json.dumps({"commands":[sys.argv[1]]}))' "$script")" \
+    --region "$REGION" --query Command.CommandId --output text 2>/dev/null) \
+    || die "could not reach instance $INSTANCE over SSM"
+
+  local status=""
+  for _ in $(seq 1 40); do
+    status=$(aws ssm get-command-invocation --command-id "$command_id" \
+      --instance-id "$INSTANCE" --region "$REGION" --query Status --output text 2>/dev/null || echo "")
+    [[ -n $status && $status != InProgress ]] && break
+    sleep 2
+  done
+  [[ $status == Success ]] || die "command on the endpoint ended as ${status:-unknown}"
+
+  aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" \
+    --region "$REGION" --query StandardOutputContent --output text
+}
+
+SERVICES="Spooler W32Time Themes"
+
+show_status() {
+  echo "Endpoint $INSTANCE"
+  echo
+  run_on_endpoint "Get-Service ${SERVICES// /,} | Select-Object Name,Status,StartType | Format-Table -AutoSize | Out-String"
+}
+
+plant() {
+  local service=$1 label=$2 ticket=$3
+  echo "Stopping $service on $INSTANCE …"
+  run_on_endpoint "Stop-Service $service -Force; (Get-Service $service).Status" | sed 's/^/  /'
+  cat <<EOF
+
+Planted: $label
+
+Now open the dashboard, go to Investigations, choose this device and paste:
+
+  $ticket
+
+The investigation has not been told what is wrong. It will collect evidence,
+propose a fix, and wait for you to approve it.
+EOF
+}
+
+case "${1:-status}" in
+status)
+  show_status
+  ;;
+printing)
+  plant Spooler "the print spooler is stopped" \
+    "Nothing prints from this computer. Print jobs disappear from the queue."
+  ;;
+clock)
+  plant W32Time "the Windows time service is stopped" \
+    "The clock on this computer keeps drifting and meetings show at the wrong time."
+  ;;
+display)
+  plant Themes "the themes service is stopped" \
+    "The desktop looks wrong on this computer, fonts and window styling are broken."
+  ;;
+reset)
+  echo "Restoring services on $INSTANCE …"
+  run_on_endpoint "foreach (\$s in '${SERVICES// /','}') { Start-Service \$s -ErrorAction SilentlyContinue }; Get-Service ${SERVICES// /,} | Select-Object Name,Status | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
+  ;;
+*)
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac
