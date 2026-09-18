@@ -176,6 +176,16 @@ curl -sX POST $HOST/api/devices/$DEVICE/restart \
 { "jobId": "…", "state": "Dispatched", "restartAt": 1758230520.0, "delaySeconds": 120 }
 ```
 
+From the CLI, where `restart` and `reboot` are the same command:
+
+```bash
+squashctl restart WIN-DEMO-1                    # prompts for the hostname, 15s
+squashctl reboot  WIN-DEMO-1 --in 120 --reason 'Monthly patch window'
+squashctl restart WIN-DEMO-1 --yes              # no prompt, for scripts
+```
+
+Without `--yes` it asks you to type the device name, and refuses outright if there is no terminal to ask at, so a restart cannot happen by accident in a pipeline.
+
 ---
 
 ## 5. Running Scripts (Jobs)
