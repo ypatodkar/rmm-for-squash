@@ -60,14 +60,26 @@ unreachable, say so plainly rather than reasoning about data you do not have.
 
 @dataclass
 class Step:
-    """One diagnostic the model asked for, and what came back."""
+    """One diagnostic the model asked for, and what came back.
+
+    `data` is the parsed output, kept so that anything reading this
+    investigation later sees what the endpoint actually reported rather than a
+    summary of whether the check ran. A summary saying "ok" describes the
+    check, not the machine, and the two are easy to confuse.
+    """
     diagnostic: str
     arguments: dict
     ok: bool
     detail: str
+    data: object | None = None
     job_id: str | None = None
     duration_ms: int | None = None
     round_trip_ms: int | None = None
+
+    def as_evidence(self) -> dict:
+        return {"diagnostic": self.diagnostic, "arguments": self.arguments,
+                "checkSucceeded": self.ok, "output": self.data,
+                "note": None if self.ok else self.detail}
 
 
 @dataclass
@@ -87,6 +99,11 @@ class Investigation:
     @property
     def concluded(self) -> bool:
         return bool(self.finding)
+
+    def evidence(self) -> list[dict]:
+        """What the endpoint reported, for anything that must judge the finding
+        against it rather than take it on trust."""
+        return [step.as_evidence() for step in self.steps]
 
     def summary(self) -> dict:
         return {
@@ -238,8 +255,8 @@ class Investigator:
 
         budget.record(name, arguments, len(result.raw_stdout))
         step = Step(name, arguments, result.succeeded, result.summary(),
-                    job_id=result.job_id, duration_ms=result.duration_ms,
-                    round_trip_ms=result.round_trip_ms)
+                    data=result.data, job_id=result.job_id,
+                    duration_ms=result.duration_ms, round_trip_ms=result.round_trip_ms)
         self._progress(investigation, "collected", {
             "diagnostic": name, "ok": result.succeeded,
             "durationMs": result.duration_ms, "roundTripMs": result.round_trip_ms,
