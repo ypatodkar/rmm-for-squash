@@ -168,6 +168,7 @@
   .inv-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 22px; flex-wrap: wrap; }
   @media (max-width: 850px) {
     .inv-layout { grid-template-columns: 1fr; }
+    .inv-layout > section { grid-row: 1; }
     .inv-list { max-height: 230px; }
     .inv-page { padding: 20px 14px; }
     .inv-card { padding: 18px; }
@@ -273,7 +274,7 @@
       <p id="jobs-error" class="jobs-error" role="alert" hidden></p>
       <div id="jobs-scroll" class="jobs-scroll" role="region" aria-labelledby="recent-jobs-heading" tabindex="0">
         <table>
-          <thead><tr><th>State</th><th>Script</th><th>Exit</th><th>Exec</th><th>Round-trip</th><th>Overhead</th></tr></thead>
+          <thead><tr><th>When</th><th>State</th><th>Script</th><th>Exit</th><th>Exec</th><th>Round-trip</th><th>Overhead</th></tr></thead>
           <tbody id="jobs"></tbody>
         </table>
       </div>
@@ -512,6 +513,7 @@ function showCommandResult(run, result) {
   const overhead = (result.roundTripMs != null && result.durationMs != null)
     ? Math.max(0, result.roundTripMs - result.durationMs) : null;
   $("output").textContent =
+    `ran at      ${absoluteTime(result.createdAt)}\n` +
     `state       ${result.state}\n` +
     `exit        ${result.exitCode ?? "—"}\n` +
     `exec        ${result.durationMs ?? "—"}ms   (on the endpoint)\n` +
@@ -574,6 +576,25 @@ $("activity-retry").onclick = async () => {
   finally { finishWatching(); }
 };
 
+// Timestamps arrive as unix seconds. Relative is what you read at a glance on a
+// live list; the exact time is on hover, in the viewer's own timezone.
+function relativeTime(unixSeconds) {
+  if (!unixSeconds) return "—";
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds));
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function absoluteTime(unixSeconds) {
+  if (!unixSeconds) return "time not recorded";
+  return new Date(unixSeconds * 1000).toLocaleString(undefined, {
+    dateStyle: "medium", timeStyle: "medium",
+  });
+}
+
 function renderJobs(list) {
   const scroller = $("jobs-scroll");
   const scrollTop = resetJobsScroll ? 0 : scroller.scrollTop;
@@ -583,6 +604,7 @@ function renderJobs(list) {
       ? Math.max(0, j.roundTripMs - j.durationMs) + "ms" : "—";
     return `
     <tr>
+      <td title="${escapeHtml(absoluteTime(j.createdAt))}">${escapeHtml(relativeTime(j.createdAt))}</td>
       <td><span class="badge ${escapeHtml(j.state)}">${escapeHtml(j.state)}</span></td>
       <td title="${escapeHtml(j.script)}">${escapeHtml((j.script || "").slice(0, 34)) || "—"}</td>
       <td>${j.exitCode ?? "—"}</td>
@@ -590,7 +612,7 @@ function renderJobs(list) {
       <td>${j.roundTripMs != null ? j.roundTripMs + "ms" : "—"}</td>
       <td style="color:var(--muted)">${overhead}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="6" class="empty">No jobs match these filters.</td></tr>';
+  }).join("") || '<tr><td colspan="7" class="empty">No jobs match these filters.</td></tr>';
   scroller.scrollTop = scrollTop;
   scroller.scrollLeft = scrollLeft;
   resetJobsScroll = false;
@@ -787,6 +809,7 @@ setInterval(poll, 3000);
   let available = false, busy = false, submitting = false, deciding = false, preview = false;
   let page = 1, totalPages = 1, activeId = null, detail = null, epoch = 0;
   let requestAttempt = null, proposalFingerprint = "", decisionPending = null, filterTimer;
+  let listRenderKey = "", detailRenderKey = "", evidenceRenderKey = "";
   const isVisible = () => !$("investigations-page").hidden;
   const stateInfo = state => states[state] || ["Unknown status", "", -1];
   const pretty = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
@@ -812,7 +835,7 @@ setInterval(poll, 3000);
     $("inv-device").disabled = submitting || !!requestAttempt?.uncertain;
     $("inv-problem").disabled = submitting || !!requestAttempt?.uncertain;
     document.querySelectorAll("[data-problem]").forEach(b => { b.disabled = submitting || !!requestAttempt?.uncertain; });
-    $("inv-new").disabled = submitting || !!requestAttempt?.uncertain;
+    $("inv-new").disabled = submitting || deciding || !!requestAttempt?.uncertain;
     $("inv-submit-note").textContent = !available
       ? "You can draft a request here. Submission becomes available when the investigation service is connected."
       : "Starts diagnostic checks. A proposed repair will wait for your approval.";
@@ -855,6 +878,9 @@ setInterval(poll, 3000);
     $("inv-page-label").textContent = `Page ${page} of ${totalPages}`;
     $("inv-prev").disabled = page <= 1;
     $("inv-next").disabled = page >= totalPages;
+    const key = JSON.stringify([data.items, activeId]);
+    if (key === listRenderKey) return;
+    listRenderKey = key;
     $("inv-list").innerHTML = data.items.length ? data.items.map(item => {
       const [label, tone] = stateInfo(item.status);
       return `<button type="button" class="inv-item" data-investigation="${escapeHtml(item.investigationId)}" aria-current="${item.investigationId === activeId}">
@@ -870,6 +896,9 @@ setInterval(poll, 3000);
     detail = data;
     $("inv-form").hidden = true; $("inv-detail").hidden = false;
     $("inv-preview-notice").hidden = !preview;
+    const renderKey = JSON.stringify([data, preview]);
+    if (renderKey === detailRenderKey) { updateDecision(); return; }
+    detailRenderKey = renderKey;
     const [label, tone, stage] = stateInfo(data.status);
     $("inv-detail-status").textContent = label; $("inv-detail-status").dataset.tone = tone;
     $("inv-detail-id").textContent = preview ? "EXAMPLE" : `Request ${data.investigationId}`;
@@ -884,9 +913,13 @@ setInterval(poll, 3000);
     $("inv-confidence").hidden = !data.confidence;
     $("inv-confidence").textContent = data.confidence ? `Confidence: ${data.confidence}` : "";
     // Every endpoint/model string is text or escaped HTML, including scripts.
-    $("inv-evidence").innerHTML = (data.evidence || []).map(step =>
-      `<details class="inv-evidence"><summary>${escapeHtml(step.diagnostic)} · ${step.checkSucceeded ? "Collected" : "Check failed"}</summary>
-      <pre>${escapeHtml(pretty(step.output ?? step.note ?? "No usable output"))}</pre></details>`).join("");
+    const evidenceKey = JSON.stringify([data.investigationId, data.evidence]);
+    if (evidenceKey !== evidenceRenderKey) {
+      evidenceRenderKey = evidenceKey;
+      $("inv-evidence").innerHTML = (data.evidence || []).map(step =>
+        `<details class="inv-evidence"><summary>${escapeHtml(step.diagnostic)} · ${step.checkSucceeded ? "Collected" : "Check failed"}</summary>
+        <pre>${escapeHtml(pretty(step.output ?? step.note ?? "No usable output"))}</pre></details>`).join("");
+    }
     const proposal = data.proposal;
     $("inv-proposal-card").hidden = !proposal;
     if (proposal) {
@@ -1063,6 +1096,7 @@ setInterval(poll, 3000);
   $("inv-next").onclick = () => { if (page < totalPages) { ++page; ++epoch; refresh(); } };
   $("apikey").addEventListener("input", () => {
     ++epoch; available = false; activeId = null; detail = null; preview = false;
+    listRenderKey = ""; detailRenderKey = ""; evidenceRenderKey = "";
     $("inv-detail").hidden = true; $("inv-form").hidden = false;
     $("inv-list").replaceChildren(); updateForm(); refresh();
   });
