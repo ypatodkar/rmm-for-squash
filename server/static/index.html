@@ -108,6 +108,73 @@
   .activity-retry { margin: 10px 0 0 26px; padding: 5px 10px; background: #223149; }
   @keyframes activity-spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { .activity-indicator { animation: none !important; } }
+  [hidden] { display: none !important; }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .topnav { display: flex; gap: 24px; padding: 0 20px; border-bottom: 1px solid var(--border); }
+  .topnav a { padding: 13px 0; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; }
+  .topnav a[aria-current="page"] { color: var(--text); border-color: var(--accent); }
+  .secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .inv-page { display: block; max-width: 1440px; margin: auto; padding: 28px 24px; }
+  .inv-heading, .inv-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .inv-heading { margin-bottom: 22px; }
+  .inv-heading h2 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -.5px; }
+  .inv-heading p { margin: 5px 0 0; color: var(--muted); }
+  .inv-layout { display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 20px; align-items: start; }
+  .inv-sidebar { padding: 16px; }
+  .inv-sidebar .jobs-filters { display: grid; grid-template-columns: 1fr; }
+  .inv-list { max-height: 620px; overflow-y: auto; margin: 12px -6px; padding: 0 6px; }
+  .inv-item { width: 100%; text-align: left; background: transparent; border: 1px solid var(--border); margin-bottom: 8px; padding: 12px; color: var(--text); }
+  .inv-item:hover, .inv-item[aria-current="true"] { background: #1a2333; border-color: var(--accent); }
+  .inv-item strong { display: block; font-size: 13px; font-weight: 500; margin: 8px 0; overflow-wrap: anywhere; }
+  .inv-item small { display: block; color: var(--muted); font-weight: normal; }
+  .inv-tag { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); background: #232833; padding: 3px 8px; border-radius: 20px; }
+  .inv-tag[data-tone="working"] { color: #9bc5ff; background: #1d2d45; }
+  .inv-tag[data-tone="approval"] { color: #ebc978; background: #352d1e; }
+  .inv-tag[data-tone="success"] { color: #82d997; background: #1b3026; }
+  .inv-tag[data-tone="error"] { color: #ffaaa6; background: #352326; }
+  .inv-tag[data-tone="working"]::before { content: ''; width: 8px; height: 8px; border: 1px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: activity-spin .9s linear infinite; }
+  .inv-card { padding: 24px; margin-bottom: 16px; }
+  .inv-card h3 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
+  .inv-card p { color: var(--muted); }
+  .inv-form label { display: block; margin: 22px 0 7px; font-weight: 500; }
+  .inv-form select { width: 100%; padding: 11px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: #0c0e12; font: inherit; }
+  .inv-form textarea { font-family: inherit; min-height: 140px; line-height: 1.6; }
+  .inv-examples { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .inv-examples button { font-family: inherit; font-size: 12px; }
+  .inv-notice { padding: 12px 16px; background: #192333; border: 1px solid #2c405e; border-radius: 8px; color: #b5cceb; margin: 0 0 18px; font-size: 13px; }
+  .inv-notice[data-tone="error"] { color: #ffaaa6; background: #2b1d22; border-color: #563238; }
+  .inv-notice button { padding: 4px 8px; margin-left: 8px; }
+  .inv-placeholder { text-align: center; padding: 28px 8px; color: var(--muted); }
+  .inv-placeholder strong { display: block; color: var(--text); font-weight: 500; margin-bottom: 6px; }
+  .inv-kicker { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: .09em; margin-bottom: 12px; }
+  .inv-stages { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; list-style: none; padding: 0; margin: 22px 0 0; }
+  .inv-stages li { border-top: 2px solid var(--border); padding-top: 9px; font-size: 12px; color: var(--muted); }
+  .inv-stages li.current { border-color: var(--accent); color: var(--text); }
+  .inv-stages li.done { border-color: var(--ok); }
+  .inv-readable { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+  .inv-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 18px 0; }
+  .inv-facts dt { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .inv-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .inv-timeline { list-style: none; padding: 0; margin: 18px 0 0; max-height: 350px; overflow: auto; }
+  .inv-timeline li { position: relative; padding: 0 0 20px 22px; border-left: 1px solid var(--border); margin-left: 5px; }
+  .inv-timeline li::before { content: ''; position: absolute; left: -4px; top: 6px; width: 7px; height: 7px; background: var(--accent); border-radius: 50%; }
+  .inv-timeline li:last-child { padding-bottom: 0; }
+  .inv-timeline time { display: block; font: 11px var(--mono); color: var(--muted); margin-bottom: 3px; }
+  .inv-evidence { border-top: 1px solid var(--border); padding-top: 12px; margin-top: 12px; }
+  .inv-evidence summary { cursor: pointer; color: var(--muted); }
+  .inv-approval { border-color: #665331; }
+  .inv-consent { display: flex; gap: 10px; align-items: flex-start; margin: 18px 0; }
+  .inv-consent input { margin-top: 4px; }
+  .inv-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 22px; flex-wrap: wrap; }
+  @media (max-width: 850px) {
+    .inv-layout { grid-template-columns: 1fr; }
+    .inv-list { max-height: 230px; }
+    .inv-page { padding: 20px 14px; }
+    .inv-card { padding: 18px; }
+    header { flex-wrap: wrap; }
+    #apikey { max-width: 45vw; }
+  }
+  @media (prefers-reduced-motion: reduce) { .inv-tag::before { animation: none !important; } }
 </style>
 </head>
 <body>
@@ -119,12 +186,17 @@
                 border-radius:5px;color:var(--text);padding:5px 9px;font-family:var(--mono);
                 font-size:12px;width:200px">
 </header>
+<nav class="topnav" aria-label="Main navigation">
+  <a href="#investigations" id="nav-investigations">Investigations</a>
+  <a href="#devices" id="nav-devices">Devices &amp; PowerShell</a>
+</nav>
 
-<main>
+<main id="devices-page" hidden>
   <section>
     <div class="panel">
       <h2>Devices</h2>
       <div id="devices"><div class="empty">No devices enrolled.</div></div>
+      <button id="investigate-device" class="secondary" style="width:100%;margin-top:12px" disabled>Investigate this device</button>
     </div>
 
     <div class="panel" style="margin-top:16px">
@@ -217,6 +289,78 @@
   </section>
 </main>
 
+<main id="investigations-page" class="inv-page">
+  <div class="inv-heading">
+    <div><h2>Investigations</h2><p>Describe the problem. Review the evidence. Decide what happens next.</p></div>
+    <button id="inv-new" type="button">+ New request</button>
+  </div>
+  <div id="inv-notice" class="inv-notice" role="status" hidden><span id="inv-notice-text"></span><button id="inv-refresh" class="secondary" type="button">Refresh</button></div>
+  <div class="inv-layout">
+    <aside class="panel inv-sidebar" aria-label="Request history">
+      <h2>Requests</h2>
+      <div class="jobs-filters">
+        <label for="inv-search">Search requests<input id="inv-search" type="search" placeholder="Problem or device name" maxlength="200"></label>
+        <label for="inv-filter">Status<select id="inv-filter">
+          <option value="">All statuses</option><option value="active">In progress</option>
+          <option value="awaiting_approval">Needs approval</option><option value="finished">Finished</option>
+        </select></label>
+      </div>
+      <div id="inv-list" class="inv-list"><div class="inv-placeholder"><strong>Your requests appear here</strong>Start an investigation to collect evidence from a device.</div></div>
+      <div class="row jobs-pagination"><button id="inv-prev" class="secondary" type="button" disabled aria-label="Previous requests">←</button><span id="inv-page-label" class="sub">Page 1</span><button id="inv-next" class="secondary" type="button" disabled aria-label="Next requests">→</button></div>
+    </aside>
+    <section aria-label="Investigation workspace">
+      <form id="inv-form" class="panel inv-card inv-form">
+        <div class="inv-kicker">AI-assisted troubleshooting</div>
+        <h3>What’s happening?</h3>
+        <p>The agent checks the device and explains what it finds. Any proposed fix needs your approval.</p>
+        <label for="inv-device">Affected device</label>
+        <select id="inv-device" required><option value="">Select a device…</option></select>
+        <div id="inv-device-note" class="sub" style="margin-top:6px">Choose the computer experiencing the problem.</div>
+        <label for="inv-problem">Describe the problem</label>
+        <textarea id="inv-problem" required minlength="10" maxlength="4000" placeholder="For example: Nothing prints from this computer. It started this morning, and restarting the printer didn’t help."></textarea>
+        <div class="inv-examples" aria-label="Example requests">
+          <button type="button" class="chip" data-problem="This computer feels slow. Can you check memory and CPU usage and explain what you find?">Computer is slow</button>
+          <button type="button" class="chip" data-problem="Nothing prints from this computer. Can you investigate the printing service?">Printing isn’t working</button>
+          <button type="button" class="chip" data-problem="I am having trouble saving files. Can you check how much disk space is available?">Trouble saving files</button>
+        </div>
+        <p id="inv-form-error" class="jobs-error" role="alert" hidden></p>
+        <div class="inv-footer"><button id="inv-submit" type="submit" disabled>Start investigation</button><button id="inv-preview" type="button" class="secondary">Preview an example</button></div>
+        <p id="inv-submit-note" class="sub">Checking investigation availability…</p>
+      </form>
+      <div id="inv-detail" hidden>
+        <div id="inv-preview-notice" class="inv-notice" hidden>Example preview — sample evidence only. No commands have been sent.<button id="inv-exit-preview" type="button" class="secondary">Back to request</button></div>
+        <section class="panel inv-card">
+          <div class="inv-card-heading"><span id="inv-detail-status" class="inv-tag" role="status"></span><span id="inv-detail-id" class="sub"></span></div>
+          <h3 id="inv-detail-title" style="margin-top:18px" class="inv-readable" tabindex="-1"></h3>
+          <p id="inv-detail-meta" class="sub"></p>
+          <ol id="inv-stages" class="inv-stages" aria-label="Investigation stages"></ol>
+        </section>
+        <section class="panel inv-card">
+          <h3>Activity</h3><p class="sub">Reported checks and results from this investigation.</p>
+          <ol id="inv-timeline" class="inv-timeline"></ol>
+        </section>
+        <section id="inv-findings-card" class="panel inv-card" hidden>
+          <div class="inv-card-heading"><h3>Findings</h3><span id="inv-confidence" class="inv-tag" hidden></span></div>
+          <div id="inv-finding" class="inv-readable"></div>
+          <div id="inv-evidence"></div>
+        </section>
+        <section id="inv-proposal-card" class="panel inv-card inv-approval" hidden>
+          <div class="inv-kicker">Your decision</div><h3 id="inv-repair-title">Proposed fix</h3>
+          <div id="inv-repair-reason" class="inv-readable"></div>
+          <dl class="inv-facts"><div><dt>Target device</dt><dd id="inv-repair-device"></dd></div><div><dt>Expected effect</dt><dd id="inv-repair-effect"></dd></div><div><dt>Impact</dt><dd id="inv-repair-risk"></dd></div><div><dt>Verification</dt><dd id="inv-repair-verification"></dd></div></dl>
+          <details><summary>Review exact PowerShell script</summary><pre id="inv-repair-script"></pre><p id="inv-repair-hash" class="sub inv-readable"></p></details>
+          <div id="inv-decision-controls">
+            <label class="inv-consent"><input id="inv-consent" type="checkbox"><span>I have reviewed this action and its impact on the target device.</span></label>
+            <div class="row"><button id="inv-approve" type="button" disabled>Approve &amp; apply fix</button><button id="inv-reject" type="button" class="secondary" disabled>Reject fix</button></div>
+          </div>
+          <p id="inv-decision-note" class="sub" role="status"></p>
+        </section>
+        <section id="inv-outcome-card" class="panel inv-card" hidden><h3 id="inv-outcome-title">Verification result</h3><div id="inv-outcome" class="inv-readable"></div></section>
+      </div>
+    </section>
+  </div>
+</main>
+
 <script>
 let selected = null;
 const JOBS_PAGE_SIZE = 30;
@@ -266,6 +410,7 @@ function formatUptime(seconds) {
 
 function renderDevices(list) {
   currentDevices = list;
+  window.dispatchEvent(new CustomEvent("devices-updated", { detail: list }));
   const el = $("devices");
   if (!list.length) {
     el.innerHTML = '<div class="empty">No devices enrolled.</div>';
@@ -626,6 +771,308 @@ $("copycmd").onclick = async () => {
 
 poll();
 setInterval(poll, 3000);
+</script>
+<script>
+// Frontend contract: docs/investigations-ui-contract.md. No raw-job dispatch
+// belongs here; the backend owns authorization, durable state and execution.
+(() => {
+  const states = {
+    queued: ["Queued", "working", 0], investigating: ["Investigating", "working", 0],
+    planning: ["Planning a fix", "working", 1], awaiting_approval: ["Needs approval", "approval", 1],
+    applying: ["Applying fix", "working", 2], verifying: ["Verifying", "working", 3],
+    completed: ["Investigation complete", "success", -1], resolved: ["Repair verified", "success", 3],
+    unresolved: ["Needs follow-up", "error", -1], failed: ["Investigation failed", "error", -1],
+    rejected: ["Fix rejected", "", -1], cancelled: ["Cancelled", "", -1],
+  };
+  let available = false, busy = false, submitting = false, deciding = false, preview = false;
+  let page = 1, totalPages = 1, activeId = null, detail = null, epoch = 0;
+  let requestAttempt = null, proposalFingerprint = "", decisionPending = null, filterTimer;
+  const isVisible = () => !$("investigations-page").hidden;
+  const stateInfo = state => states[state] || ["Unknown status", "", -1];
+  const pretty = value => typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const date = value => {
+    if (!value) return "";
+    const parsed = new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  };
+  const path = id => `/api/investigations/${encodeURIComponent(id)}`;
+  const request = (url, options = {}) => api(url, { signal: AbortSignal.timeout(15000), ...options });
+  const post = (url, body) => request(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  function notice(message = "", error = false) {
+    $("inv-notice").hidden = !message;
+    $("inv-notice").dataset.tone = error ? "error" : "info";
+    $("inv-notice-text").textContent = message;
+  }
+
+  function updateForm() {
+    const device = currentDevices.find(d => d.deviceId === $("inv-device").value);
+    $("inv-submit").disabled = submitting || !available || !device || device.revoked || $("inv-problem").value.trim().length < 10;
+    $("inv-submit").textContent = submitting ? "Submitting…" : requestAttempt?.uncertain ? "Retry same request" : "Start investigation";
+    $("inv-device").disabled = submitting || !!requestAttempt?.uncertain;
+    $("inv-problem").disabled = submitting || !!requestAttempt?.uncertain;
+    document.querySelectorAll("[data-problem]").forEach(b => { b.disabled = submitting || !!requestAttempt?.uncertain; });
+    $("inv-new").disabled = submitting || !!requestAttempt?.uncertain;
+    $("inv-submit-note").textContent = !available
+      ? "You can draft a request here. Submission becomes available when the investigation service is connected."
+      : "Starts diagnostic checks. A proposed repair will wait for your approval.";
+    $("inv-device-note").textContent = !device ? "Choose the computer experiencing the problem."
+      : device.revoked ? "This device is revoked. Select an authorized device."
+      : device.online ? `${device.hostname} is online.`
+      : `${device.hostname} is offline. The agent may be unable to collect evidence.`;
+  }
+
+  function updateDevices() {
+    const select = $("inv-device"), previous = select.value;
+    const html = '<option value="">Select a device…</option>' + currentDevices.map(d =>
+      `<option value="${escapeHtml(d.deviceId)}" ${d.revoked ? "disabled" : ""}>${escapeHtml(d.hostname)} · ${d.revoked ? "revoked" : d.online ? "online" : "offline"}</option>`).join("");
+    if (select.innerHTML !== html) { select.innerHTML = html; select.value = previous; }
+    $("investigate-device").disabled = !selected || !currentDevices.some(d => d.deviceId === selected && !d.revoked);
+    updateForm();
+  }
+
+  function showForm(deviceId) {
+    if (submitting || deciding || requestAttempt?.uncertain) return;
+    activeId = null; detail = null; preview = false; decisionPending = null; ++epoch;
+    $("inv-form").hidden = false; $("inv-detail").hidden = true;
+    if (deviceId) $("inv-device").value = deviceId;
+    updateForm();
+    $("inv-problem").focus();
+  }
+
+  function route() {
+    const devices = location.hash === "#devices";
+    $("devices-page").hidden = !devices;
+    $("investigations-page").hidden = devices;
+    $("nav-devices").setAttribute("aria-current", devices ? "page" : "false");
+    $("nav-investigations").setAttribute("aria-current", devices ? "false" : "page");
+    if (!devices) refresh();
+  }
+
+  function renderList(data) {
+    totalPages = Math.max(1, Number(data.totalPages) || 1);
+    page = Math.max(1, Number(data.page) || 1);
+    $("inv-page-label").textContent = `Page ${page} of ${totalPages}`;
+    $("inv-prev").disabled = page <= 1;
+    $("inv-next").disabled = page >= totalPages;
+    $("inv-list").innerHTML = data.items.length ? data.items.map(item => {
+      const [label, tone] = stateInfo(item.status);
+      return `<button type="button" class="inv-item" data-investigation="${escapeHtml(item.investigationId)}" aria-current="${item.investigationId === activeId}">
+        <span class="inv-tag" data-tone="${tone}">${label}</span><strong>${escapeHtml(String(item.problem || "Untitled request").slice(0, 140))}</strong>
+        <small>${escapeHtml(item.hostname || item.deviceId)} · ${escapeHtml(date(item.createdAt))}</small></button>`;
+    }).join("") : '<div class="inv-placeholder"><strong>No requests to show</strong>Start a new request or change your filters.</div>';
+    $("inv-list").querySelectorAll("[data-investigation]").forEach(button => {
+      button.onclick = () => openInvestigation(button.dataset.investigation);
+    });
+  }
+
+  function renderDetail(data) {
+    detail = data;
+    $("inv-form").hidden = true; $("inv-detail").hidden = false;
+    $("inv-preview-notice").hidden = !preview;
+    const [label, tone, stage] = stateInfo(data.status);
+    $("inv-detail-status").textContent = label; $("inv-detail-status").dataset.tone = tone;
+    $("inv-detail-id").textContent = preview ? "EXAMPLE" : `Request ${data.investigationId}`;
+    $("inv-detail-title").textContent = data.problem;
+    $("inv-detail-meta").textContent = `${data.hostname || data.deviceId} · ${date(data.createdAt)}`;
+    $("inv-stages").innerHTML = ["Diagnose", "Review fix", "Apply", "Verify"].map((title, index) =>
+      `<li class="${index === stage ? "current" : stage > index ? "done" : ""}" ${index === stage ? 'aria-current="step"' : ""}>${index + 1}. ${title}</li>`).join("");
+    $("inv-timeline").innerHTML = (data.events || []).map(event =>
+      `<li><time>${escapeHtml(date(event.at))}</time><span class="inv-readable">${escapeHtml(event.message)}</span></li>`).join("") || '<li>Waiting for the first reported activity.</li>';
+    $("inv-findings-card").hidden = !data.finding;
+    $("inv-finding").textContent = data.finding || "";
+    $("inv-confidence").hidden = !data.confidence;
+    $("inv-confidence").textContent = data.confidence ? `Confidence: ${data.confidence}` : "";
+    // Every endpoint/model string is text or escaped HTML, including scripts.
+    $("inv-evidence").innerHTML = (data.evidence || []).map(step =>
+      `<details class="inv-evidence"><summary>${escapeHtml(step.diagnostic)} · ${step.checkSucceeded ? "Collected" : "Check failed"}</summary>
+      <pre>${escapeHtml(pretty(step.output ?? step.note ?? "No usable output"))}</pre></details>`).join("");
+    const proposal = data.proposal;
+    $("inv-proposal-card").hidden = !proposal;
+    if (proposal) {
+      $("inv-repair-title").textContent = proposal.decision === "proposed" ? "Proposed fix" : "No automatic repair proposed";
+      $("inv-repair-reason").textContent = proposal.reasoning || proposal.refusalReason || "";
+      $("inv-repair-device").textContent = `${data.hostname || data.deviceId} (${data.deviceId})`;
+      $("inv-repair-effect").textContent = proposal.expectedEffect || "—";
+      $("inv-repair-risk").textContent = proposal.risk || "—";
+      $("inv-repair-verification").textContent = proposal.verifiedBy || "—";
+      $("inv-repair-script").textContent = proposal.script || "No script proposed.";
+      $("inv-repair-hash").textContent = proposal.scriptSha256 ? `SHA-256: ${proposal.scriptSha256}` : "";
+    }
+    const fingerprint = JSON.stringify([data.investigationId, data.deviceId, proposal]);
+    if (fingerprint !== proposalFingerprint) { $("inv-consent").checked = false; proposalFingerprint = fingerprint; }
+    if (data.status !== "awaiting_approval") decisionPending = null;
+    updateDecision();
+    $("inv-outcome-card").hidden = !data.outcome && !data.error;
+    $("inv-outcome-title").textContent = data.outcome?.resolved === true ? "Repair condition verified"
+      : data.outcome?.resolved === false ? "Repair did not resolve the condition" : "Outcome needs follow-up";
+    $("inv-outcome").textContent = data.outcome?.detail || data.error || "";
+  }
+
+  function updateDecision() {
+    const p = detail?.proposal;
+    const awaiting = detail?.status === "awaiting_approval" && p?.decision === "proposed";
+    const expired = !p?.expiresAt || !Number.isFinite(Date.parse(p.expiresAt)) || Date.now() >= Date.parse(p.expiresAt);
+    const actionable = awaiting && !preview && available && !!p?.proposalHash && !!p?.scriptSha256 && !!p?.script && !expired && !deciding && !decisionPending;
+    $("inv-decision-controls").hidden = !awaiting;
+    $("inv-approve").disabled = !actionable || !$("inv-consent").checked;
+    $("inv-reject").disabled = !awaiting || preview || !available || deciding || !!decisionPending;
+    $("inv-consent").disabled = !actionable;
+    $("inv-decision-note").textContent = preview ? "Approval is disabled in this example."
+      : decisionPending ? "Decision submitted. Waiting for the server’s confirmed status; refresh to check."
+      : deciding ? "Checking the current proposal and recording your decision…"
+      : !awaiting ? "" : !available ? "Reconnect before making a decision."
+      : expired ? "This proposal needs to be refreshed before it can be approved."
+      : !p.proposalHash ? "This proposal is not ready for approval."
+      : "Approval applies only to this proposal and target device.";
+  }
+
+  async function openInvestigation(id) {
+    if (submitting || requestAttempt?.uncertain || deciding) return;
+    activeId = id; preview = false; detail = null; decisionPending = null;
+    const token = ++epoch;
+    $("inv-form").hidden = true; $("inv-detail").hidden = true;
+    notice("Loading investigation…");
+    try {
+      const data = await request(path(id));
+      if (token !== epoch || activeId !== id) return;
+      available = true; notice(); renderDetail(data); $("inv-detail-title").focus();
+    } catch (error) {
+      if (token !== epoch) return;
+      available = false; notice(`Could not load this investigation: ${error.message}`, true);
+    }
+    updateForm();
+  }
+
+  async function refresh() {
+    if (busy || !isVisible() || submitting || deciding) return;
+    busy = true;
+    const token = epoch;
+    try {
+      const query = new URLSearchParams({ page, pageSize: 30 });
+      if ($("inv-search").value.trim()) query.set("search", $("inv-search").value.trim());
+      if ($("inv-filter").value) query.set("status", $("inv-filter").value);
+      const list = await request(`/api/investigations?${query}`);
+      if (token !== epoch) return;
+      if (!Array.isArray(list.items)) throw new Error("Unexpected investigation response.");
+      available = true; renderList(list); notice();
+      if (activeId && !preview) {
+        const id = activeId;
+        const data = await request(path(id));
+        if (token !== epoch || activeId !== id) return;
+        renderDetail(data);
+      }
+    } catch (error) {
+      if (token !== epoch) return;
+      available = false;
+      notice(error.status === 404 || error.status === 405
+        ? "Investigations are not available yet. You can draft a request or preview an example."
+        : `Updates paused: ${error.message}. Your request may still be running.`, error.status !== 404 && error.status !== 405);
+    } finally {
+      busy = false; updateForm(); updateDecision();
+    }
+  }
+
+  $("inv-form").onsubmit = async event => {
+    event.preventDefault();
+    if (submitting || $("inv-submit").disabled || !$("inv-form").reportValidity()) return;
+    const payload = { deviceId: $("inv-device").value, problem: $("inv-problem").value.trim() };
+    if (!requestAttempt) requestAttempt = { ...payload, requestId: crypto.randomUUID() };
+    submitting = true; ++epoch; updateForm(); $("apikey").disabled = true; $("inv-form-error").hidden = true;
+    try {
+      const created = await post("/api/investigations", {
+        deviceId: requestAttempt.deviceId, problem: requestAttempt.problem, requestId: requestAttempt.requestId,
+      });
+      if (!created.investigationId) throw new Error("The server did not return a request ID.");
+      requestAttempt = null; $("inv-problem").value = "";
+      submitting = false;
+      await openInvestigation(created.investigationId);
+    } catch (error) {
+      const uncertain = !error.status || error.status >= 500;
+      if (uncertain) requestAttempt.uncertain = true; else requestAttempt = null;
+      if (error.status === 404 || error.status === 405) available = false;
+      $("inv-form-error").textContent = uncertain
+        ? "Could not confirm submission. Retry the same request to check or create it once; your draft is preserved."
+        : `Request was not accepted: ${error.message}`;
+      $("inv-form-error").hidden = false;
+    } finally { submitting = false; $("apikey").disabled = false; updateForm(); refresh(); }
+  };
+
+  async function decide(decision) {
+    if (deciding || preview || !detail || $(decision === "approve" ? "inv-approve" : "inv-reject").disabled) return;
+    const snapshot = detail, fingerprint = proposalFingerprint, id = detail.investigationId;
+    deciding = true; ++epoch; $("apikey").disabled = true; $("inv-new").disabled = true; updateDecision();
+    try {
+      const fresh = await request(path(id));
+      const same = JSON.stringify([fresh.investigationId, fresh.deviceId, fresh.proposal]) === fingerprint;
+      if (fresh.status !== "awaiting_approval" || !same) {
+        renderDetail(fresh); notice("The proposal changed. Review the latest action before deciding."); return;
+      }
+      if (decision === "approve" && Date.now() >= Date.parse(fresh.proposal.expiresAt)) {
+        renderDetail(fresh); notice("The proposal expired. A fresh proposal is needed."); return;
+      }
+      // The server must recompute/validate this immutable proposal binding,
+      // authenticate the operator, and deduplicate by proposal + decision.
+      decisionPending = id;
+      const result = await post(`${path(id)}/decision`, {
+        proposalId: snapshot.proposal.proposalId, proposalHash: snapshot.proposal.proposalHash,
+        deviceId: snapshot.deviceId, decision,
+      });
+      if (result.investigationId === id && result.status) renderDetail(result);
+      notice("Decision recorded. Waiting for the next reported update.");
+    } catch (error) {
+      if (error.status && error.status < 500) decisionPending = null;
+      notice(`Could not confirm the decision: ${error.message}. Refresh to check its status.`, true);
+      available = false;
+    } finally { deciding = false; $("apikey").disabled = false; updateForm(); updateDecision(); }
+  }
+
+  function showPreview() {
+    if (submitting || requestAttempt?.uncertain) return;
+    ++epoch; activeId = null; preview = true;
+    const at = new Date().toISOString();
+    renderDetail({ investigationId: "example", deviceId: "example-pc", hostname: "OFFICE-PC", createdAt: at,
+      problem: "Nothing prints from this computer.", status: "awaiting_approval", confidence: "high",
+      finding: "The Print Spooler service is stopped. That prevents this computer from processing print jobs. Starting it is a reasonable next step; this check does not establish whether the physical printer is working.",
+      events: [{ at, message: "Request received for OFFICE-PC." }, { at, message: "Diagnosis agent checked the Print Spooler service." },
+        { at, message: "Service status returned: Stopped." }, { at, message: "Repair planner proposed starting Spooler. Waiting for operator review." }],
+      evidence: [{ diagnostic: "service_status", checkSucceeded: true, output: { name: "Spooler", status: "Stopped", startType: "Automatic" } }],
+      proposal: { decision: "proposed", proposalId: "example-proposal", reasoning: "The service check confirms that Spooler is stopped.",
+        expectedEffect: "Allow Windows to process print jobs again.", risk: "Starts a service that may have been stopped deliberately.",
+        verifiedBy: "Check that Spooler is running, then ask the user to try printing.", script: "Start-Service -Name 'Spooler' -ErrorAction Stop", scriptSha256: "", proposalHash: "", expiresAt: at },
+    });
+    $("inv-detail-title").focus();
+  }
+
+  $("inv-approve").onclick = () => decide("approve");
+  $("inv-reject").onclick = () => decide("reject");
+  $("inv-consent").onchange = updateDecision;
+  $("inv-new").onclick = () => showForm();
+  $("inv-exit-preview").onclick = () => showForm();
+  $("inv-preview").onclick = showPreview;
+  $("inv-refresh").onclick = () => refresh();
+  $("inv-device").onchange = updateForm;
+  $("inv-problem").oninput = updateForm;
+  $("investigate-device").onclick = () => { location.hash = "investigations"; showForm(selected); };
+  document.querySelectorAll("[data-problem]").forEach(button => {
+    button.onclick = () => { $("inv-problem").value = button.dataset.problem; updateForm(); $("inv-problem").focus(); };
+  });
+  const filter = () => { ++epoch; page = 1; clearTimeout(filterTimer); filterTimer = setTimeout(refresh, 250); };
+  $("inv-search").oninput = filter; $("inv-filter").onchange = filter;
+  $("inv-prev").onclick = () => { if (page > 1) { --page; ++epoch; refresh(); } };
+  $("inv-next").onclick = () => { if (page < totalPages) { ++page; ++epoch; refresh(); } };
+  $("apikey").addEventListener("input", () => {
+    ++epoch; available = false; activeId = null; detail = null; preview = false;
+    $("inv-detail").hidden = true; $("inv-form").hidden = false;
+    $("inv-list").replaceChildren(); updateForm(); refresh();
+  });
+  window.addEventListener("devices-updated", updateDevices);
+  window.addEventListener("hashchange", route);
+  // Poll snapshots of real activity only. No simulated progress or automatic
+  // action retries; a lost decision response is reconciled through a GET.
+  setInterval(() => { updateDevices(); updateDecision(); refresh(); }, 3000);
+  updateDevices(); route();
+})();
 </script>
 </body>
 </html>

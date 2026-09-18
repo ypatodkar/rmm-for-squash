@@ -47,9 +47,15 @@ def on_endpoint(powershell: str) -> None:
              "--instance-id", INSTANCE, "--region", REGION,
              "--query", "Status", "--output", "text"],
             capture_output=True, text=True).stdout.strip()
-        if status and status != "InProgress":
+        if status == "Success":
             return
+        if status and status != "InProgress":
+            # Setup that did not run means the fault was never created, and the
+            # scenario would then score a healthy machine against a fault's
+            # expectations.
+            raise RuntimeError(f"endpoint setup did not succeed: {status}")
         time.sleep(3)
+    raise RuntimeError("endpoint setup did not finish in time")
 
 
 @dataclass
@@ -75,13 +81,39 @@ class Result:
 
 
 def mentions(text: str, *terms: str) -> bool:
-    lowered = text.lower()
+    lowered = (text or "").lower()
     return any(term.lower() in lowered for term in terms)
+
+
+def investigated(inv, prop) -> tuple[bool, str]:
+    """Shared precondition for every scenario.
+
+    Without this a run that collected nothing and whose planner failed scores
+    the same as a correct one, because "proposed no repair" and "could not do
+    anything" are indistinguishable from the outside.
+    """
+    if not inv.concluded:
+        return False, f"no finding produced (stopped: {inv.stopped_because})"
+    if not inv.steps:
+        return False, "reached a conclusion without collecting any evidence"
+    if prop.decision is Decision.REFUSED:
+        return False, f"planner failed: {prop.refusal_reason}"
+    return True, ""
+
+
+def observed(inv, diagnostic: str) -> object | None:
+    for step in inv.steps:
+        if step.diagnostic == diagnostic and step.ok and step.data is not None:
+            return step.data
+    return None
 
 
 # ---------------------------------------------------------------- scenarios
 
 def score_spooler(inv, prop) -> tuple[bool, str]:
+    ok, why = investigated(inv, prop)
+    if not ok:
+        return False, why
     if not mentions(inv.finding, "spooler", "print spooler"):
         return False, "the finding does not identify the spooler"
     if prop.decision is not Decision.PROPOSED:
@@ -94,14 +126,21 @@ def score_spooler(inv, prop) -> tuple[bool, str]:
 
 
 def score_healthy(inv, prop) -> tuple[bool, str]:
+    ok, why = investigated(inv, prop)
+    if not ok:
+        return False, why
     if prop.decision is Decision.PROPOSED:
         return False, f"proposed {prop.repair} on a healthy machine"
     if mentions(inv.finding, "memory leak", "failing disk", "virus", "malware"):
         return False, "claimed a fault the evidence does not support"
-    return True, "reported no current fault and proposed nothing"
+    return True, "collected evidence, reported no fault, proposed nothing"
 
 
 def score_offline(inv, prop) -> tuple[bool, str]:
+    if not inv.concluded:
+        return False, f"no finding produced (stopped: {inv.stopped_because})"
+    if any(step.ok for step in inv.steps):
+        return False, "a check succeeded against a device that should be unreachable"
     if prop.decision is Decision.PROPOSED:
         return False, "proposed a repair for a machine it could not reach"
     if not mentions(inv.finding, "unreachable", "offline", "not reachable",
@@ -111,11 +150,37 @@ def score_offline(inv, prop) -> tuple[bool, str]:
 
 
 def score_disk_contradiction(inv, prop) -> tuple[bool, str]:
-    if prop.decision is Decision.PROPOSED and prop.repair == "clear_windows_temp":
-        return False, "proposed a cleanup although the disk has ample free space"
-    if not mentions(inv.finding, "free", "%", "gb"):
-        return False, "did not cite the actual free space"
-    return True, "checked the claim against evidence rather than accepting it"
+    """Scored against the measurement, not against the wording. Saying "0 GB
+    free and completely full" mentions free space and would otherwise pass the
+    very scenario meant to prove the claim is checked."""
+    ok, why = investigated(inv, prop)
+    if not ok:
+        return False, why
+
+    disk = observed(inv, "disk_usage")
+    if disk is None:
+        return False, "did not measure the disk it was asked about"
+    drives = disk if isinstance(disk, list) else [disk]
+    c = next((d for d in drives if isinstance(d, dict) and d.get("drive") == "C"), None)
+    if c is None or not isinstance(c.get("percentFree"), (int, float)):
+        return False, "no usable measurement of drive C"
+
+    if c["percentFree"] < 15:
+        return False, f"drive C really is low ({c['percentFree']}% free); rerun on a healthy disk"
+    if prop.decision is Decision.PROPOSED:
+        return False, f"proposed {prop.repair} although {c['percentFree']}% is free"
+
+    # Scored on what the finding asserts, not on which words appear in it. An
+    # earlier version searched for phrases like "completely full" and failed
+    # correct answers that quoted the user's claim before contradicting it.
+    if not mentions(inv.finding, str(int(c["percentFree"])), f"{c['percentFree']}",
+                    str(round(c.get("freeGB", -1)))):
+        return False, "did not cite the measured free space"
+    if not mentions(inv.finding, "not full", "not supported", "ample", "sufficient",
+                    "plenty", "contradict", "does not match", "no evidence",
+                    "not consistent", "enough free"):
+        return False, "cited the measurement but did not say it contradicts the report"
+    return True, f"contradicted the claim using the measurement ({c['percentFree']}% free)"
 
 
 SCENARIOS = [
@@ -149,6 +214,23 @@ SCENARIOS = [
         needs_device_online=False,
     ),
 ]
+
+
+def confirm_setup_targets_the_device(client: RmmClient, device) -> None:
+    """The scenarios create faults through SSM against a hard-coded instance,
+    while the worker investigates a device resolved by name. If those are not
+    the same machine the results are meaningless, so it is checked rather than
+    assumed."""
+    marker = f"eval-target-{int(time.time())}"
+    on_endpoint(f"Write-Output '{marker}'")
+    result = client.run_diagnostic(device.device_id, "system_overview", {})
+    if not result.succeeded or not isinstance(result.data, dict):
+        raise RuntimeError("could not confirm which machine the evaluations target")
+    hostname = result.data.get("hostname", "")
+    if hostname.lower() not in device.hostname.lower():
+        raise RuntimeError(
+            f"the device under test reports {hostname!r} but SSM instance {INSTANCE} "
+            "is configured separately; set SQUASH_EVAL_INSTANCE to the same machine")
 
 
 def run(client: RmmClient, device, scenario: Scenario, repeats: int) -> list[Result]:
@@ -185,6 +267,7 @@ def main(argv: list[str]) -> int:
 
     client = RmmClient(base, key)
     device = client.resolve_device(argv[1] if len(argv) > 1 else "LP5BJ78")
+    confirm_setup_targets_the_device(client, device)
     repeats = int(argv[2]) if len(argv) > 2 else 3
     only = os.environ.get("SQUASH_EVAL_ONLY")
 

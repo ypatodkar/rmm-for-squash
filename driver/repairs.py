@@ -52,7 +52,14 @@ class Repair:
     timeout_seconds: int = 60
 
     def validate(self, arguments: dict | None = None) -> dict:
-        arguments = arguments or {}
+        if arguments is None:
+            arguments = {}
+        # Arguments arrive from model-generated JSON, so the container's type is
+        # itself untrusted: a bare number here would otherwise raise rather than
+        # producing a refusal the workflow can report.
+        if not isinstance(arguments, dict):
+            raise ArgumentError(f"{self.name}: arguments must be an object, "
+                                f"got {type(arguments).__name__}")
         unexpected = set(arguments) - set(self.parameters)
         if unexpected:
             raise ArgumentError(f"unknown argument(s): {', '.join(sorted(unexpected))}")

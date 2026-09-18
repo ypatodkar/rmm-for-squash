@@ -51,8 +51,7 @@ def proposal_for(service="Spooler"):
 
 
 def approval_for(proposal, by="operator"):
-    return Approval(proposal_id=proposal.proposal_id,
-                    script_sha256=proposal.script_sha256, approved_by=by)
+    return Approval.grant(proposal, by)
 
 
 class ApprovalTests(unittest.TestCase):
@@ -70,19 +69,52 @@ class ApprovalTests(unittest.TestCase):
         self.assertIn("different proposal", outcome.detail)
         self.assertEqual(rmm.dispatched, [])
 
-    def test_a_proposal_altered_after_approval_is_refused(self):
-        """The hash is what ties an approval to the action a human actually saw."""
+    def test_a_proposal_retargeted_after_approval_is_refused(self):
         proposal = proposal_for("Spooler")
         approval = approval_for(proposal)
         tampered = repairs.get("start_service").build({"service_name": "RemoteRegistry"})
         proposal.script = tampered
         proposal.script_sha256 = sha256_hex(tampered)
+        proposal.arguments = {"service_name": "RemoteRegistry"}
 
         rmm = FakeRmm()
         outcome = Applier(rmm).apply(proposal, approval)
         self.assertFalse(outcome.applied)
-        self.assertIn("changed after it was approved", outcome.detail)
         self.assertEqual(rmm.dispatched, [])
+
+    def test_a_script_swapped_without_updating_its_hash_is_refused(self):
+        """Comparing one stored field against another proves only that nobody
+        changed both. The script that runs is rebuilt from the catalogue."""
+        proposal = proposal_for("Spooler")
+        approval = approval_for(proposal)
+        proposal.script = "Remove-Item C:\\ -Recurse -Force"   # hash left untouched
+
+        rmm = FakeRmm(checks=[diagnostic_result({"status": "Stopped"}),
+                              diagnostic_result({"status": "Running"})])
+        outcome = Applier(rmm).apply(proposal, approval)
+        self.assertFalse(outcome.applied)
+        self.assertEqual(rmm.dispatched, [], "a substituted script reached the endpoint")
+
+    def test_the_device_cannot_be_changed_after_approval(self):
+        proposal = proposal_for("Spooler")
+        approval = approval_for(proposal)
+        proposal.device_id = "a-different-machine"
+
+        rmm = FakeRmm(checks=[diagnostic_result({"status": "Stopped"}),
+                              diagnostic_result({"status": "Running"})])
+        outcome = Applier(rmm).apply(proposal, approval)
+        self.assertFalse(outcome.applied)
+        self.assertIn("different device", outcome.detail)
+        self.assertEqual(rmm.dispatched, [])
+
+    def test_what_executes_is_the_catalogue_script_not_the_stored_one(self):
+        proposal = proposal_for("Spooler")
+        approval = approval_for(proposal)
+        rmm = FakeRmm(checks=[diagnostic_result({"status": "Stopped"}),
+                              diagnostic_result({"status": "Running"})])
+        Applier(rmm).apply(proposal, approval)
+        _, script, _ = rmm.dispatched[0]
+        self.assertEqual(script, repairs.get("start_service").build({"service_name": "Spooler"}))
 
     def test_an_expired_approval_is_refused(self):
         proposal = proposal_for()
@@ -99,7 +131,7 @@ class ApprovalTests(unittest.TestCase):
             proposal = Proposal(investigation_id="i", device_id="d", hostname="h",
                                 decision=decision)
             rmm = FakeRmm()
-            outcome = Applier(rmm).apply(proposal, Approval("x", "y", "operator"))
+            outcome = Applier(rmm).apply(proposal, Approval("x", "y", "operator", "d", "start_service"))
             self.assertFalse(outcome.applied)
             self.assertEqual(rmm.dispatched, [])
 

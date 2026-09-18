@@ -138,6 +138,12 @@ class RmmClient:
             if isinstance(error.reason, RmmError):
                 raise error.reason from None
             raise RmmError(f"control plane unreachable: {error.reason}") from None
+        except (TimeoutError, OSError) as error:
+            # A socket timeout surfaces here rather than as URLError. Left
+            # uncaught it escapes the workflow's error handling entirely.
+            raise RmmError(f"control plane did not respond: {error}") from None
+        except json.JSONDecodeError as error:
+            raise RmmError(f"control plane returned malformed JSON: {error}") from None
 
     # ---------- devices ----------
 

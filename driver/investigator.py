@@ -237,6 +237,7 @@ class Investigator:
         try:
             diagnostics.get(name).build(arguments)
         except ArgumentError as error:
+            budget.record_attempt(name, arguments, succeeded=False)
             step = Step(name, arguments, False, str(error))
             self._progress(investigation, "refused", {"diagnostic": name, "reason": str(error)})
             return step, f"Refused: {error}"
@@ -247,13 +248,16 @@ class Investigator:
                 investigation.device_id, name, arguments,
                 deadline_seconds=min(60.0, max(5.0, budget.remaining_seconds)))
         except DeviceUnavailable as error:
+            budget.record_attempt(name, arguments, succeeded=False)
             step = Step(name, arguments, False, str(error))
             return step, f"The device is not reachable: {error}. No data was collected."
         except (RmmError, ArgumentError) as error:
+            budget.record_attempt(name, arguments, succeeded=False)
             step = Step(name, arguments, False, str(error))
             return step, f"The check could not be completed: {error}"
 
-        budget.record(name, arguments, len(result.raw_stdout))
+        budget.record_attempt(name, arguments, succeeded=result.succeeded,
+                              output_bytes=len(result.raw_stdout))
         step = Step(name, arguments, result.succeeded, result.summary(),
                     data=result.data, job_id=result.job_id,
                     duration_ms=result.duration_ms, round_trip_ms=result.round_trip_ms)

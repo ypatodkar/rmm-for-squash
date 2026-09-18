@@ -93,21 +93,63 @@ class Proposal:
 
 @dataclass
 class Approval:
+    """Authorises one action, on one device, in one investigation.
+
+    Every field is recorded at the moment a human saw the proposal. Nothing is
+    read back out of the proposal at execution time, because a proposal is
+    mutable state and an approval must describe what was actually shown.
+    """
     proposal_id: str
     script_sha256: str
     approved_by: str
+    device_id: str
+    repair: str
+    arguments: dict = field(default_factory=dict)
     approved_at: float = field(default_factory=time.time)
 
-    def matches(self, proposal: Proposal) -> tuple[bool, str]:
-        """An approval authorises one action. Anything that differs from what
-        was shown to the human is not that action."""
-        if self.proposal_id != proposal.proposal_id:
-            return False, "approval is for a different proposal"
-        if self.script_sha256 != proposal.script_sha256:
-            return False, "the proposed script changed after it was approved"
-        if time.time() - self.approved_at > APPROVAL_TTL_SECONDS:
-            return False, "approval has expired; the machine's state may have moved on"
-        return True, "ok"
+    @classmethod
+    def grant(cls, proposal: Proposal, approved_by: str) -> "Approval":
+        return cls(proposal_id=proposal.proposal_id, script_sha256=proposal.script_sha256,
+                   approved_by=approved_by, device_id=proposal.device_id,
+                   repair=proposal.repair or "", arguments=dict(proposal.arguments))
+
+
+def authorize(proposal: Proposal, approval: Approval | None) -> tuple[str | None, str]:
+    """Decides what may be executed, and returns the script to run.
+
+    The script is rebuilt from the catalogue rather than taken from the
+    proposal. A stored script and a stored hash of it can disagree -- a
+    proposal is ordinary mutable state, and comparing one stored field against
+    another proves only that nobody changed both. Rebuilding from the repair
+    name and arguments means the thing dispatched is, by construction, the
+    reviewed script for those arguments, and the hash a human approved is
+    checked against that rather than against a claim.
+    """
+    if not proposal.actionable:
+        return None, f"nothing to apply: {proposal.decision.value}"
+    if approval is None:
+        return None, "no approval"
+
+    if approval.proposal_id != proposal.proposal_id:
+        return None, "approval is for a different proposal"
+    if approval.device_id != proposal.device_id:
+        return None, "approval was granted for a different device"
+    if approval.repair != proposal.repair or approval.arguments != proposal.arguments:
+        return None, "the proposed action changed after it was approved"
+    if time.time() - approval.approved_at > APPROVAL_TTL_SECONDS:
+        return None, "approval has expired; the machine's state may have moved on"
+
+    try:
+        rebuilt = repairs.get(approval.repair).build(approval.arguments)
+    except ArgumentError as error:
+        return None, f"approved action is not a valid repair: {error}"
+
+    if sha256_hex(rebuilt) != approval.script_sha256:
+        return None, "the approved script does not match the reviewed repair"
+    if proposal.script != rebuilt:
+        return None, "the proposal no longer matches the reviewed repair"
+
+    return rebuilt, "ok"
 
 
 @dataclass
@@ -200,21 +242,16 @@ class Applier:
         self._on_progress = on_progress or (lambda event, detail: None)
 
     def apply(self, proposal: Proposal, approval: Approval | None) -> Outcome:
-        if not proposal.actionable:
-            return Outcome(False, None, f"nothing to apply: {proposal.decision.value}")
-
-        if approval is None:
-            return Outcome(False, None, "refused: no approval")
-
-        ok, reason = approval.matches(proposal)
-        if not ok:
+        script, reason = authorize(proposal, approval)
+        if script is None:
             self._progress("refused", {"reason": reason})
             return Outcome(False, None, f"refused: {reason}")
 
-        repair = repairs.get(proposal.repair)
+        repair = repairs.get(approval.repair)
+        device_id = approval.device_id
 
         # The machine may have moved on while a human was deciding.
-        before = self._evaluate(proposal, repair.precondition)
+        before = self._evaluate(device_id, approval.arguments, repair.precondition)
         if before is None:
             return Outcome(False, None, "refused: could not confirm current state")
         if not before:
@@ -227,7 +264,7 @@ class Applier:
                                     "arguments": proposal.arguments})
         try:
             job = self._client.run_raw(
-                proposal.device_id, proposal.script,
+                device_id, script,
                 timeout_seconds=repair.timeout_seconds,
                 idempotency_key=f"repair-{proposal.proposal_id}")
         except (RmmError, DeviceUnavailable) as error:
@@ -243,7 +280,7 @@ class Applier:
         # Exiting zero means the command ran. Whether the problem is gone is a
         # separate question, and only the verification predicate answers it.
         self._progress("verifying", {"check": repair.verification.describes})
-        after = self._evaluate(proposal, repair.verification)
+        after = self._evaluate(device_id, approval.arguments, repair.verification)
         if after is None:
             return Outcome(True, None, "the repair ran, but its effect could not be verified",
                            job_id=job.get("jobId"), exit_code=0, before=True)
@@ -253,13 +290,13 @@ class Applier:
         return Outcome(True, after, detail, job_id=job.get("jobId"), exit_code=0,
                        before=True, after=after)
 
-    def _evaluate(self, proposal: Proposal, check) -> bool | None:
+    def _evaluate(self, device_id: str, arguments: dict, check) -> bool | None:
         """Runs a check and applies its predicate. None means the check itself
         could not be completed, which is not the same as the condition being
         false and must not be treated as one."""
         try:
             result = self._client.run_diagnostic(
-                proposal.device_id, check.diagnostic, check.arguments(proposal.arguments))
+                device_id, check.diagnostic, check.arguments(arguments))
         except (RmmError, DeviceUnavailable, ArgumentError):
             return None
         if not result.succeeded or result.data is None:

@@ -3,6 +3,24 @@
 How the AI worker gets from a reported problem to a repair, and what stops it
 doing anything it shouldn't along the way.
 
+## What is built, and what is not
+
+This document describes the design. Not all of it is implemented, and the
+distinction matters when reading the rest.
+
+**Built and exercised against a live endpoint.** The diagnosis loop, the
+diagnostic and repair catalogues, the planner, approval checking, the
+precondition recheck, dispatch, verification by predicate, and the budget. These
+are Python components driven from a script or the test suite.
+
+**Not built.** Durable storage of investigations, dashboard routes for
+submitting a ticket or granting an approval, a background worker that claims
+pending work, and recovery after a worker restart. The handoff record described
+below exists in memory for the duration of a run and is not persisted, so the
+failure-attribution property it provides is currently a design claim rather than
+a working feature. Recovery behaviour described under failure modes is likewise
+designed and not implemented.
+
 ## The shape
 
 ```
@@ -79,10 +97,17 @@ automation causes incidents.
 
 ## Approval
 
-An approval authorises one action, on one device, in one investigation. It is
-bound to the SHA-256 of the exact script — the same hash the control plane
-already computes for result attestation — so a proposal that changes in any way
-after approval no longer matches, and dispatch is refused.
+An approval authorises one action, on one device, in one investigation. It
+records the device, the repair, its arguments and the SHA-256 of the exact
+script at the moment a human saw them.
+
+What is dispatched is then **rebuilt from the catalogue** using the approved
+repair and arguments, and checked against the approved hash. It is never the
+script stored on the proposal. Comparing a stored script against a stored hash
+of it establishes only that nobody altered both: a proposal is ordinary mutable
+state, and an earlier version of this code accepted a substituted script whose
+hash field had been left untouched. Rebuilding makes the executed text the
+reviewed text by construction rather than by comparison.
 
 Approval is recorded with who granted it and when, and expires: an approval that
 has been sitting unused is evidence about a machine's state that has since gone

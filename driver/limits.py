@@ -25,8 +25,15 @@ class Budget:
     # Repeating the same check with the same arguments adds no evidence; a loop
     # doing so is stuck, and should stop rather than burn the whole budget.
     max_repeats_per_diagnostic: int = 2
+    # Attempts that never produced a result -- an offline device, a refused
+    # argument -- consume real time and dispatches. Counting only successes
+    # would let a failing loop run until the wall clock alone stopped it.
+    max_attempts: int = 20
+    max_failed_attempts: int = 6
 
     diagnostics_run: int = 0
+    attempts: int = 0
+    failed_attempts: int = 0
     output_bytes: int = 0
     started_at: float = field(default_factory=time.monotonic)
     _signatures: dict[str, int] = field(default_factory=dict)
@@ -46,6 +53,13 @@ class Budget:
             raise BudgetExceeded(
                 f"reached the limit of {self.max_diagnostics} diagnostics")
 
+        if self.attempts >= self.max_attempts:
+            raise BudgetExceeded(f"reached the limit of {self.max_attempts} attempts")
+
+        if self.failed_attempts >= self.max_failed_attempts:
+            raise BudgetExceeded(
+                f"{self.failed_attempts} checks failed; stopping rather than retrying further")
+
         if self.elapsed_seconds >= self.max_wall_clock_seconds:
             raise BudgetExceeded(
                 f"investigation exceeded {self.max_wall_clock_seconds:.0f}s")
@@ -60,11 +74,21 @@ class Budget:
                 f"'{diagnostic}' has already been run "
                 f"{self.max_repeats_per_diagnostic} times with these arguments")
 
-    def record(self, diagnostic: str, arguments: dict | None, output_bytes: int) -> None:
-        self.diagnostics_run += 1
-        self.output_bytes += max(0, output_bytes)
+    def record_attempt(self, diagnostic: str, arguments: dict | None, *,
+                       succeeded: bool, output_bytes: int = 0) -> None:
+        """Counts every attempt, whether or not it produced data. An attempt
+        that failed still cost a dispatch and still moves the loop forward."""
+        self.attempts += 1
         signature = _signature(diagnostic, arguments)
         self._signatures[signature] = self._signatures.get(signature, 0) + 1
+        if succeeded:
+            self.diagnostics_run += 1
+            self.output_bytes += max(0, output_bytes)
+        else:
+            self.failed_attempts += 1
+
+    def record(self, diagnostic: str, arguments: dict | None, output_bytes: int) -> None:
+        self.record_attempt(diagnostic, arguments, succeeded=True, output_bytes=output_bytes)
 
     def summary(self) -> dict:
         return {

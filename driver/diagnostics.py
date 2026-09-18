@@ -60,7 +60,11 @@ class Diagnostic:
         """Validates arguments and substitutes them. Literal braces in a script
         must be doubled, since every script goes through the same substitution
         whether or not it declares parameters."""
-        arguments = arguments or {}
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ArgumentError(f"{self.name}: arguments must be an object, "
+                                f"got {type(arguments).__name__}")
         unexpected = set(arguments) - set(self.parameters)
         if unexpected:
             raise ArgumentError(f"unknown argument(s): {', '.join(sorted(unexpected))}")
