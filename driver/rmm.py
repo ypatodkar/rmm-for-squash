@@ -221,6 +221,27 @@ class RmmClient:
             raise RmmError(f"deadline of {deadline:.2f}s elapsed before the request completed")
         return remaining
 
+    def run_raw(self, device_id: str, script: str, *, timeout_seconds: int = 60,
+                idempotency_key: str | None = None,
+                deadline_seconds: float | None = None) -> dict:
+        """Dispatches an already-built script and returns the raw job.
+
+        Used for repairs, whose scripts come from the repair catalogue and have
+        already been validated there. Nothing should pass model-authored text to
+        this: the catalogue is what bounds what can run, and bypassing it would
+        make that bound meaningless.
+        """
+        deadline = deadline_seconds or timeout_seconds + 30
+        expires_at = time.monotonic() + deadline
+        dispatch = self._request("POST", f"/api/devices/{device_id}/jobs", {
+            "script": script,
+            "timeoutSeconds": timeout_seconds,
+            "idempotencyKey": idempotency_key or f"repair-{uuid.uuid4().hex}",
+        }, timeout=self._remaining(expires_at, deadline))
+        job = self._await_terminal(dispatch["jobId"], expires_at, deadline)
+        job.setdefault("jobId", dispatch["jobId"])
+        return job
+
     def _await_terminal(self, job_id: str, expires_at: float, deadline_seconds: float) -> dict:
         """Waits for a terminal state or gives up. The control plane's own
         supervisor also forces terminal states, so this deadline guards against
