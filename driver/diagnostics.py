@@ -163,14 +163,23 @@ CATALOG: dict[str, Diagnostic] = {
             summary="Recent error-level entries from the System event log.",
             parameters={"hours": bounded_int(1, 168), "max_events": bounded_int(1, 50)},
             timeout_seconds=60,
+            # Get-WinEvent exits non-zero when nothing matches the filter, which
+            # makes "no errors were logged" indistinguishable from "the check
+            # failed". An empty result is a finding in its own right, so it is
+            # returned as an empty list with a successful exit.
             script=(
-                "Get-WinEvent -FilterHashtable @{{LogName='System';Level=2;"
+                "$found = @(Get-WinEvent -FilterHashtable @{{LogName='System';Level=2;"
                 "StartTime=(Get-Date).AddHours(-{hours})}} "
-                "-MaxEvents {max_events} -ErrorAction SilentlyContinue "
-                "| Select-Object @{{N='timeCreated';E={{$_.TimeCreated.ToUniversalTime().ToString('o')}}}},"
+                "-MaxEvents {max_events} -ErrorAction SilentlyContinue); "
+                "$rows = @($found | Select-Object "
+                "@{{N='timeCreated';E={{$_.TimeCreated.ToUniversalTime().ToString('o')}}}},"
                 "@{{N='provider';E={{$_.ProviderName}}}},@{{N='eventId';E={{$_.Id}}}},"
-                "@{{N='message';E={{if ($_.Message) {{$_.Message.Substring(0,[Math]::Min(300,$_.Message.Length))}} else {{'' }}}}}} "
-                f"{_JSON}"
+                "@{{N='message';E={{if ($_.Message) {{$_.Message.Substring(0,[Math]::Min(300,$_.Message.Length))}} else {{'' }}}}}}); "
+                "if ($rows.Count -eq 0) {{ '[]' }} else {{ $rows "
+                # f-string: '}}}}' survives as '}}' so that .format() later
+                # renders the single brace PowerShell needs.
+                f"{_JSON} }}}}; "
+                "exit 0"
             ),
         ),
     ]
