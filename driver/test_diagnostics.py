@@ -13,7 +13,8 @@ class CatalogTests(unittest.TestCase):
             diagnostics.get("delete_everything")
 
     def test_every_catalogue_entry_builds_with_no_placeholder_left_behind(self):
-        defaults = {"top_n": 5, "hours": 1, "max_events": 5, "service_name": "Spooler"}
+        defaults = {"top_n": 5, "hours": 1, "max_events": 5, "service_name": "Spooler",
+                    "host": "fileserver.corp.local", "name": "fileserver.corp.local", "port": 445}
         for name, diagnostic in diagnostics.CATALOG.items():
             arguments = {k: defaults[k] for k in diagnostic.parameters}
             script = diagnostic.build(arguments)
@@ -26,7 +27,8 @@ class CatalogTests(unittest.TestCase):
         """A mutating verb in this catalogue would defeat the point of it."""
         forbidden = ("Remove-", "Stop-Service", "Stop-Process", "Set-", "New-Item",
                      "shutdown", "Restart-", "Start-Service", "Invoke-Expression")
-        defaults = {"top_n": 5, "hours": 1, "max_events": 5, "service_name": "Spooler"}
+        defaults = {"top_n": 5, "hours": 1, "max_events": 5, "service_name": "Spooler",
+                    "host": "fileserver.corp.local", "name": "fileserver.corp.local", "port": 445}
         for name, diagnostic in diagnostics.CATALOG.items():
             script = diagnostic.build({k: defaults[k] for k in diagnostic.parameters})
             for verb in forbidden:

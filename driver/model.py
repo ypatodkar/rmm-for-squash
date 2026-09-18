@@ -14,6 +14,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from redaction import redact
 
@@ -157,9 +158,17 @@ def from_environment() -> Model:
     raise ModelError(f"unsupported model provider: {provider!r}")
 
 
-def load_dotenv(path: str = ".env") -> None:
+# The repository's .env, where setup puts it. The CLI tools are run from
+# driver/, so a bare ".env" alone would never find it.
+_REPO_ENV = Path(__file__).resolve().parent.parent / ".env"
+
+
+def load_dotenv(path: str | None = None) -> None:
     """Minimal .env reader so a key never has to be pasted onto a command line,
-    where it would land in shell history."""
+    where it would land in shell history. With no path, a .env in the current
+    directory is used if there is one, and the repository's otherwise."""
+    if path is None:
+        path = ".env" if Path(".env").is_file() else str(_REPO_ENV)
     try:
         with open(path, encoding="utf-8") as handle:
             for line in handle:

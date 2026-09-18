@@ -135,6 +135,13 @@ def tool_definitions() -> list[dict]:
                   "description": "How far back to look."},
         "max_events": {"type": "integer", "minimum": 1, "maximum": 50,
                        "description": "Maximum events to return."},
+        "host": {"type": "string",
+                 "description": "Hostname or IPv4 address, e.g. fileserver.corp.local "
+                                "or 172.31.16.1."},
+        "name": {"type": "string",
+                 "description": "Hostname to resolve, e.g. fileserver.corp.local."},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                 "description": "TCP port, e.g. 445 for file sharing, 443 for HTTPS."},
     }
     definitions = []
     for name, diagnostic in sorted(diagnostics.CATALOG.items()):
@@ -270,7 +277,7 @@ class Investigator:
         self._progress(investigation, "collected", {
             "diagnostic": name, "ok": result.succeeded,
             "durationMs": result.duration_ms, "roundTripMs": result.round_trip_ms,
-            "jobId": result.job_id})
+            "jobId": result.job_id, "data": result.data})
         return step, _observation(result)
 
     def _final_word(self, messages: list[dict], tools: list[dict],

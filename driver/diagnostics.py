@@ -48,6 +48,32 @@ def windows_name(maximum_length: int = 64) -> Callable[[object], str]:
     return validate
 
 
+_HOST = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$")
+
+
+def host_name() -> Callable[[object], str]:
+    """A DNS name or an IPv4 address. Like windows_name, it is substituted
+    into a script, so only the characters a hostname can contain are allowed:
+    no quotes, spaces or separators, and nothing that could start a statement."""
+    def validate(value: object) -> str:
+        if not isinstance(value, str) or not _HOST.match(value):
+            raise ArgumentError("must be a hostname or IPv4 address "
+                                "(letters, digits, hyphens and dots)")
+        return value
+    return validate
+
+
+def _ps(script: str) -> str:
+    """Lets a script be written as ordinary PowerShell. Every script goes
+    through str.format, so literal braces must be doubled; doing that by hand
+    has gone wrong before. Here braces are literal and <<name>> marks a
+    parameter."""
+    escaped = script.replace("{", "{{").replace("}", "}}")
+    return re.sub(r"<<(\w+)>>", r"{\1}", escaped)
+
+
 @dataclass(frozen=True)
 class Diagnostic:
     name: str
@@ -181,6 +207,138 @@ CATALOG: dict[str, Diagnostic] = {
                 f"{_JSON} }}}}; "
                 "exit 0"
             ),
+        ),
+
+        # ---- network: from the machine outward, one layer at a time ----
+        # Each reports a failure to connect as data, with exit 0. "The host did
+        # not answer" is the finding; only a check that could not run at all is
+        # a failed check. Timeouts are short so a dead end costs seconds.
+        Diagnostic(
+            name="network_adapters",
+            summary="Network adapters: whether each is up, its IPv4 address, default "
+                    "gateway and DNS servers. The first step for any connectivity problem.",
+            # .NET rather than Get-NetIPConfiguration, which takes three
+            # seconds to load its module.
+            script=_ps(r"""
+$rows = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+  Where-Object { $_.NetworkInterfaceType -ne 'Loopback' } | ForEach-Object {
+    $ip = $_.GetIPProperties()
+    [pscustomobject]@{
+      name = $_.Name
+      status = $_.OperationalStatus.ToString()
+      ipv4 = @($ip.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } |
+               ForEach-Object { $_.Address.ToString() })
+      gateways = @($ip.GatewayAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } |
+                   ForEach-Object { $_.Address.ToString() })
+      dnsServers = @($ip.DnsAddresses | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                     ForEach-Object { $_.ToString() })
+    }
+  })
+ConvertTo-Json -InputObject $rows -Depth 4 -Compress
+"""),
+        ),
+        Diagnostic(
+            name="ping_host",
+            summary="Sends two pings to a host or IP (1s timeout each) and reports "
+                    "replies and round-trip times. Many hosts ignore ping, so no reply "
+                    "alone does not prove a host is unreachable; confirm with test_tcp_port.",
+            parameters={"host": host_name()},
+            script=_ps(r"""
+$ping = New-Object Net.NetworkInformation.Ping
+$replies = @(1..2 | ForEach-Object {
+  try {
+    $r = $ping.Send('<<host>>', 1000)
+    [pscustomobject]@{ status = $r.Status.ToString(); ms = $r.RoundtripTime; from = "$($r.Address)" }
+  } catch {
+    [pscustomobject]@{ status = 'Error: ' + $_.Exception.GetBaseException().Message; ms = $null; from = $null }
+  }
+})
+[pscustomobject]@{
+  host = '<<host>>'
+  sent = 2
+  received = @($replies | Where-Object { $_.status -eq 'Success' }).Count
+  replies = $replies
+} | ConvertTo-Json -Depth 4 -Compress
+"""),
+        ),
+        Diagnostic(
+            name="resolve_name",
+            summary="Resolves a hostname two ways: asking the DNS server directly, and "
+                    "through the system resolver, which also reads the hosts file. "
+                    "Different answers mean a local override. Includes matching "
+                    "hosts-file lines.",
+            parameters={"name": host_name()},
+            script=_ps(r"""
+$name = '<<name>>'
+$dnsAnswer = @(); $dnsError = $null
+try {
+  $dnsAnswer = @(Resolve-DnsName $name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop |
+                 Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress })
+} catch { $dnsError = $_.Exception.Message }
+$systemAnswer = @(); $systemError = $null
+try {
+  $systemAnswer = @([Net.Dns]::GetHostAddresses($name) |
+                    Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.ToString() })
+} catch { $systemError = $_.Exception.GetBaseException().Message }
+$hostsFile = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$pattern = '(^|\s)' + [regex]::Escape($name) + '(\s|$)'
+$hostsLines = @(Get-Content $hostsFile -ErrorAction SilentlyContinue |
+  Where-Object { $_ -notmatch '^\s*#' -and $_ -match $pattern } | ForEach-Object { $_.Trim() })
+[pscustomobject]@{
+  name = $name
+  dnsServerAnswer = $dnsAnswer
+  dnsServerError = $dnsError
+  systemAnswer = $systemAnswer
+  systemError = $systemError
+  hostsFileEntries = $hostsLines
+} | ConvertTo-Json -Depth 4 -Compress
+"""),
+        ),
+        Diagnostic(
+            name="test_tcp_port",
+            summary="Tries to open a TCP connection to a host and port (2s timeout), e.g. "
+                    "445 for a file share, 443 for HTTPS, 3389 for RDP. Reports connected, "
+                    "refused or timed out.",
+            parameters={"host": host_name(), "port": bounded_int(1, 65535)},
+            script=_ps(r"""
+$client = New-Object Net.Sockets.TcpClient
+$timer = [Diagnostics.Stopwatch]::StartNew()
+try {
+  if ($client.ConnectAsync('<<host>>', <<port>>).Wait(2000)) { $result = 'connected' }
+  else { $result = 'timed out after 2000ms' }
+} catch {
+  $result = 'failed: ' + $_.Exception.GetBaseException().Message
+} finally { $client.Close() }
+[pscustomobject]@{
+  host = '<<host>>'
+  port = <<port>>
+  connected = ($result -eq 'connected')
+  result = $result
+  ms = [int]$timer.ElapsedMilliseconds
+} | ConvertTo-Json -Compress
+"""),
+        ),
+        Diagnostic(
+            name="outbound_firewall_blocks",
+            summary="Enabled Windows Firewall rules that block outbound traffic, with the "
+                    "addresses and ports each one blocks. Use when a host is reachable "
+                    "from elsewhere but not from this machine.",
+            timeout_seconds=45,
+            script=_ps(r"""
+$rules = @(Get-NetFirewallRule -Direction Outbound -Action Block -Enabled True -ErrorAction SilentlyContinue |
+  Select-Object -First 25 | ForEach-Object {
+    $address = $_ | Get-NetFirewallAddressFilter
+    $port = $_ | Get-NetFirewallPortFilter
+    [pscustomobject]@{
+      name = $_.DisplayName
+      profile = $_.Profile.ToString()
+      remoteAddress = @($address.RemoteAddress)
+      protocol = "$($port.Protocol)"
+      remotePort = @($port.RemotePort)
+    }
+  })
+ConvertTo-Json -InputObject $rules -Depth 4 -Compress
+"""),
         ),
     ]
 }

@@ -50,7 +50,7 @@ The AI driver acts just like a human operator using the API. It has its own API 
 
 **Strict AI Rules**
 
-* **Menus, not blank canvases:** The investigation and remediation agents cannot write PowerShell. They can only choose from a reviewed menu of six read-only diagnostics and four repairs. The separate operator jobs API still supports arbitrary PowerShell, as required for remote management.
+* **Menus, not blank canvases:** The investigation and remediation agents cannot write PowerShell. They can only choose from a reviewed menu of eleven read-only diagnostics (six for system health, five for network connectivity) and four repairs. The separate operator jobs API still supports arbitrary PowerShell, as required for remote management.
 
 * **Quarantined text:** Device output and user text are clearly labelled as untrusted and wrapped in randomized delimiters before a model sees them. This makes prompt injection harder; the catalogues, fixed device, execution budgets and human approval enforce the actual action boundary.
 

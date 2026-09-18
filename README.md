@@ -195,6 +195,7 @@ There are two ways to run an investigation:
 Two scripts support demos against an EC2 endpoint (they need the AWS CLI with
 SSM access):
 
-- `scripts/plant-fault printing|clock|display|memory|reset` breaks something
-  real out of band.
+- `scripts/plant-fault printing|clock|display|memory|dns|firewall|reset` breaks
+  something real out of band. `firewall` is the multi-step network demo: the
+  AI checks the adapter, pings, resolves, tests the port, and finds the rule.
 - `driver/evals.py <hostname> [repeats]` scores the driver against known faults.

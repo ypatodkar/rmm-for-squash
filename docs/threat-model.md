@@ -65,7 +65,7 @@ keep endpoint text out of HTML and command syntax.
 Before text reaches a model, the driver labels it untrusted and wraps it in a
 random delimiter that the text cannot close. This reduces prompt-injection
 risk; capability limits provide the security boundary. Diagnosis exposes only
-six reviewed read-only checks, remediation exposes only four reviewed repairs,
+eleven reviewed read-only checks, remediation exposes only four reviewed repairs,
 the device is fixed for the investigation, and budgets cap time, attempts,
 failures and output. The raw operator job API remains unrestricted by design.
 

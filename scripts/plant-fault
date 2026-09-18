@@ -11,6 +11,8 @@
 #   scripts/plant-fault clock             stop the Windows time service
 #   scripts/plant-fault display           stop the themes service
 #   scripts/plant-fault memory            start a process that eats 1.5 GB
+#   scripts/plant-fault dns               point example.com at a dead address (hosts file)
+#   scripts/plant-fault firewall          block one.one.one.one with an outbound rule
 #   scripts/plant-fault reset             put everything back
 #
 #   SQUASH_EVAL_INSTANCE   EC2 instance id of the endpoint (default below)
@@ -45,10 +47,19 @@ run_on_endpoint() {
 
 SERVICES="Spooler W32Time Themes"
 
+# Network faults are marked so reset removes exactly what was added, and they
+# only ever touch these two names. Nothing here may affect the control plane
+# or SSM, or the machine could not be reached to undo it.
+DNS_TARGET="example.com"
+DNS_MARKER="squash-demo"
+FIREWALL_RULE="SquashDemoBlock"
+
 show_status() {
   echo "Endpoint $INSTANCE"
   echo
-  run_on_endpoint "Get-Service ${SERVICES// /,} | Select-Object Name,Status,StartType | Format-Table -AutoSize | Out-String"
+  run_on_endpoint "Get-Service ${SERVICES// /,} | Select-Object Name,Status,StartType | Format-Table -AutoSize | Out-String;
+'hosts-file demo entries: ' + @(Select-String -Path \$env:SystemRoot\\System32\\drivers\\etc\\hosts -Pattern '$DNS_MARKER' | ForEach-Object { \$_.Line }).Count;
+'demo firewall rule: ' + [bool](Get-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue)"
 }
 
 plant() {
@@ -107,7 +118,55 @@ The investigation has not been told what is wrong. It will collect evidence,
 propose a fix, and wait for you to approve it.
 EOF
   ;;
+dns)
+  echo "Pointing $DNS_TARGET at a dead address on $INSTANCE …"
+  run_on_endpoint "\$hosts = Join-Path \$env:SystemRoot 'System32\\drivers\\etc\\hosts';
+if (-not (Select-String -Path \$hosts -Pattern '$DNS_MARKER' -Quiet)) {
+  Add-Content -Path \$hosts -Value '10.255.255.1 $DNS_TARGET # $DNS_MARKER' -Encoding ASCII
+};
+ipconfig /flushdns | Out-Null;
+'hosts file now has: ' + (Select-String -Path \$hosts -Pattern '$DNS_MARKER').Line" | sed 's/^/  /'
+  cat <<EOF
+
+Planted: $DNS_TARGET resolves to 10.255.255.1 through a hosts-file entry,
+while the DNS server still gives the right answer.
+
+Ticket to paste:
+
+  This computer can't open $DNS_TARGET. Other websites work fine.
+
+Or from the terminal:
+
+  (cd driver && ../.venv/bin/python diagnose.py <hostname> "This computer can't open $DNS_TARGET. Other websites work fine.")
+EOF
+  ;;
+firewall)
+  echo "Blocking one.one.one.one outbound on $INSTANCE …"
+  run_on_endpoint "Remove-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue;
+New-NetFirewallRule -Name $FIREWALL_RULE -DisplayName 'Block one.one.one.one' -Direction Outbound -Action Block -RemoteAddress 1.1.1.1,1.0.0.1 -Profile Any | Out-Null;
+'rule added: ' + (Get-NetFirewallRule -Name $FIREWALL_RULE).DisplayName" | sed 's/^/  /'
+  cat <<'EOF'
+
+Planted: an outbound firewall rule blocks 1.1.1.1 and 1.0.0.1. Name
+resolution still works, so the break is after DNS.
+
+Ticket to paste:
+
+  This machine can't reach one.one.one.one, but the rest of the internet works.
+
+Or from the terminal:
+
+  (cd driver && ../.venv/bin/python diagnose.py <hostname> "This machine can't reach one.one.one.one, but the rest of the internet works.")
+EOF
+  ;;
 reset)
+  echo "Removing network faults on $INSTANCE …"
+  run_on_endpoint "Remove-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue;
+\$hosts = Join-Path \$env:SystemRoot 'System32\\drivers\\etc\\hosts';
+\$kept = @(Get-Content \$hosts | Where-Object { \$_ -notmatch '$DNS_MARKER' });
+Set-Content -Path \$hosts -Value \$kept -Encoding ASCII;
+ipconfig /flushdns | Out-Null;
+'network faults removed'" | sed 's/^/  /'
   echo "Restoring services on $INSTANCE …"
   run_on_endpoint "Get-Process ReportBuilder -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue;
 Remove-Item (Join-Path \$env:TEMP 'ReportBuilder.exe') -Force -ErrorAction SilentlyContinue;
@@ -115,7 +174,7 @@ foreach (\$s in '${SERVICES// /','}') { Start-Service \$s -ErrorAction SilentlyC
 Get-Service ${SERVICES// /,} | Select-Object Name,Status | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
   ;;
 *)
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
   ;;
 esac

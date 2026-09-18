@@ -16,6 +16,47 @@ from rmm import DeviceUnavailable, RmmClient, RmmError
 START = time.monotonic()
 
 
+def clean(value: object, limit: int = 60) -> str:
+    """Endpoint text goes to a terminal, where control characters could move
+    the cursor or rewrite what was printed. Only printable text survives."""
+    text = "".join(c for c in str(value) if c.isprintable())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def summarize(diagnostic: str, data: object) -> str:
+    """One line saying what a check found, so the narrowing is visible as it
+    happens. Reads only fields each check is known to return."""
+    def rows(value):
+        return value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+
+    try:
+        if diagnostic == "network_adapters":
+            parts = [f"{clean(a.get('name'))} {clean(a.get('status'))}, "
+                     f"ip {clean(', '.join(a.get('ipv4') or []) or 'none')}, "
+                     f"gateway {clean(', '.join(a.get('gateways') or []) or 'none')}"
+                     for a in rows(data)]
+            return "; ".join(parts) or "no adapters"
+        if diagnostic == "ping_host":
+            statuses = {clean(r.get("status")) for r in rows(data.get("replies"))}
+            return (f"{data.get('received')}/{data.get('sent')} replies"
+                    + ("" if data.get("received") else f" ({', '.join(sorted(statuses))})"))
+        if diagnostic == "resolve_name":
+            dns = ", ".join(data.get("dnsServerAnswer") or []) or clean(data.get("dnsServerError") or "none")
+            system = ", ".join(data.get("systemAnswer") or []) or clean(data.get("systemError") or "none")
+            hosts = len(data.get("hostsFileEntries") or [])
+            return (f"DNS server says {clean(dns)}; this machine uses {clean(system)}"
+                    + (f"; {hosts} hosts-file entr{'y' if hosts == 1 else 'ies'}" if hosts else ""))
+        if diagnostic == "test_tcp_port":
+            return f"port {data.get('port')}: {clean(data.get('result'))}"
+        if diagnostic == "outbound_firewall_blocks":
+            names = [clean(r.get("name"), 40) for r in rows(data)]
+            return f"{len(names)} blocking rule(s): {', '.join(names)}" if names else "no blocking rules"
+    except (AttributeError, TypeError):
+        pass
+    count = len(data) if isinstance(data, list) else 1 if data is not None else 0
+    return f"{count} result{'s' if count != 1 else ''}"
+
+
 def show(event: str, detail: dict) -> None:
     elapsed = time.monotonic() - START
     if event == "collecting":
@@ -23,9 +64,13 @@ def show(event: str, detail: dict) -> None:
         suffix = f" {args}" if args else ""
         print(f"  [{elapsed:5.1f}s] running {detail['diagnostic']}{suffix}")
     elif event == "collected":
-        mark = "ok" if detail.get("ok") else "failed"
-        print(f"  [{elapsed:5.1f}s]   {mark} in {detail.get('durationMs')}ms "
-              f"(round-trip {detail.get('roundTripMs')}ms, job {str(detail.get('jobId'))[:8]})")
+        # "check failed" means the check itself could not run. What it found --
+        # including that a host did not answer -- is the line's result.
+        found = summarize(detail["diagnostic"], detail.get("data")) if detail.get("ok") \
+            else "check failed"
+        print(f"  [{elapsed:5.1f}s]   -> {found}")
+        print(f"            {detail.get('durationMs')}ms on the endpoint, "
+              f"{detail.get('roundTripMs')}ms round-trip")
     elif event == "refused":
         print(f"  [{elapsed:5.1f}s] refused {detail['diagnostic']}: {detail['reason']}")
     elif event == "analyzing":
@@ -76,7 +121,8 @@ def main(argv: list[str]) -> int:
     print(f"stopped because: {summary['stoppedBecause']}")
     print()
     for index, step in enumerate(result.steps, 1):
-        print(f"  {index}. {step.diagnostic}{step.arguments or ''} -> {step.detail}")
+        found = summarize(step.diagnostic, step.data) if step.ok else step.detail
+        print(f"  {index}. {step.diagnostic}{step.arguments or ''} -> {found}")
     return 0 if result.concluded else 1
 
 
