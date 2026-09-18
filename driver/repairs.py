@@ -24,15 +24,19 @@ class Check:
     Used for both preconditions and verification, so 'is this repair
     applicable' and 'did it work' are answered the same way and neither
     depends on a model's opinion.
+
+    The predicate receives the repair's own arguments as well as the output,
+    because some conditions are only meaningful relative to them -- whether a
+    particular process is still running, rather than whether any process is.
     """
     diagnostic: str
     arguments: Callable[[dict], dict]
-    predicate: Callable[[object], bool]
+    predicate: Callable[[object, dict], bool]
     describes: str
 
-    def evaluate(self, data: object) -> bool:
+    def evaluate(self, data: object, arguments: dict | None = None) -> bool:
         try:
-            return bool(self.predicate(data))
+            return bool(self.predicate(data, arguments or {}))
         except (TypeError, KeyError, AttributeError, IndexError):
             # Absent or unexpected output is not evidence that a condition
             # holds. Treating it as satisfied would let a failed check
@@ -79,14 +83,69 @@ class Repair:
         return self.script.format(**self.validate(arguments))
 
 
-def _service_is(status: str) -> Callable[[object], bool]:
-    def predicate(data: object) -> bool:
+# Processes that keep Windows running, or that keep this agent able to receive
+# the next instruction. Stopping any of them is never a repair, so the name is
+# refused before a proposal can be built rather than being left to a model's
+# judgement or an operator's attention at approval time.
+PROTECTED_PROCESSES = frozenset(name.lower() for name in [
+    "system", "idle", "registry", "memory compression",
+    "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsm",
+    "svchost", "dwm", "explorer", "fontdrvhost", "sihost", "taskhostw",
+    "msmpeng",                      # Defender: stopping it disables protection
+    "squashrmm.agent",              # this agent: stopping it strands the device
+    "amazonssmagent", "ssm-agent-worker",
+])
+
+MIN_REPAIRABLE_MEMORY_MB = 300
+
+
+def killable_process_name(maximum_length: int = 64) -> Callable[[object], str]:
+    """A process name that may be stopped. Narrow character class as elsewhere,
+    plus a refusal for anything the machine needs to keep running."""
+    base = windows_name(maximum_length)
+
+    def validate(value: object) -> str:
+        name = base(value)
+        if name.lower().removesuffix(".exe") in PROTECTED_PROCESSES \
+                or name.lower() in PROTECTED_PROCESSES:
+            raise ArgumentError(
+                f"'{name}' is required by Windows or by this agent and is never stopped")
+        return name
+    return validate
+
+
+def process_id() -> Callable[[object], int]:
+    def validate(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ArgumentError("expected a numeric process id")
+        if not 8 <= value <= 0xFFFFFFFF:
+            raise ArgumentError(f"{value} is not a process that may be stopped")
+        return value
+    return validate
+
+
+def _process_present(data: object, pid: int, name: str, min_memory_mb: int = 0) -> bool:
+    rows = data if isinstance(data, list) else [data]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("pid") == pid and str(row.get("name", "")).lower() == name.lower():
+            memory = row.get("memoryMB")
+            if min_memory_mb and not (isinstance(memory, (int, float))
+                                      and memory >= min_memory_mb):
+                return False
+            return True
+    return False
+
+
+def _service_is(status: str) -> Callable[[object, dict], bool]:
+    def predicate(data: object, arguments: dict) -> bool:
         return isinstance(data, dict) and data.get("status") == status
     return predicate
 
 
-def _free_space_below(threshold_percent: float) -> Callable[[object], bool]:
-    def predicate(data: object) -> bool:
+def _free_space_below(threshold_percent: float) -> Callable[[object, dict], bool]:
+    def predicate(data: object, arguments: dict) -> bool:
         drives = data if isinstance(data, list) else [data]
         return any(isinstance(d, dict) and d.get("drive") == "C"
                    and isinstance(d.get("percentFree"), (int, float))
@@ -95,8 +154,8 @@ def _free_space_below(threshold_percent: float) -> Callable[[object], bool]:
     return predicate
 
 
-def _free_space_at_least(threshold_percent: float) -> Callable[[object], bool]:
-    def predicate(data: object) -> bool:
+def _free_space_at_least(threshold_percent: float) -> Callable[[object, dict], bool]:
+    def predicate(data: object, arguments: dict) -> bool:
         drives = data if isinstance(data, list) else [data]
         return any(isinstance(d, dict) and d.get("drive") == "C"
                    and isinstance(d.get("percentFree"), (int, float))
@@ -118,7 +177,7 @@ CATALOG: dict[str, Repair] = {
             precondition=Check(
                 diagnostic="service_status",
                 arguments=lambda a: {"service_name": a["service_name"]},
-                predicate=lambda data: isinstance(data, dict)
+                predicate=lambda data, arguments: isinstance(data, dict)
                                        and data.get("status") in {"Stopped", "StopPending",
                                                                   "Paused", "StartPending"},
                 describes="the service is not running",
@@ -153,6 +212,41 @@ CATALOG: dict[str, Repair] = {
                 describes="the service is running",
             ),
             risk="Low. A service that was stopped deliberately would be started again.",
+        ),
+        Repair(
+            name="stop_process",
+            summary="Stop a single process that is consuming an unreasonable amount of memory.",
+            parameters={"process_name": killable_process_name(), "pid": process_id()},
+            # The endpoint re-checks that the pid still belongs to the named
+            # process immediately before stopping it. A pid is reused as soon as
+            # it is freed, so a check made anywhere else -- here, at proposal
+            # time, even at precondition time -- can be stale by the time the
+            # command lands, and would stop whatever inherited the number.
+            script=(
+                "$p = Get-Process -Id {pid} -ErrorAction Stop; "
+                "if ($p.ProcessName -ne '{process_name}') {{ "
+                "throw \"pid {pid} is now '$($p.ProcessName)', not '{process_name}'; refusing\" }}; "
+                "$mb = [int]($p.WorkingSet64/1MB); "
+                "Stop-Process -Id {pid} -Force -ErrorAction Stop; "
+                "\"stopped {process_name} (pid {pid}, was $mb MB)\""
+            ),
+            precondition=Check(
+                diagnostic="top_processes_by_memory",
+                arguments=lambda a: {"top_n": 25},
+                predicate=lambda data, arguments: _process_present(
+                    data, arguments.get("pid"), arguments.get("process_name", ""),
+                    MIN_REPAIRABLE_MEMORY_MB),
+                describes="the process is running and is among the largest memory consumers",
+            ),
+            verification=Check(
+                diagnostic="top_processes_by_memory",
+                arguments=lambda a: {"top_n": 25},
+                predicate=lambda data, arguments: not _process_present(
+                    data, arguments.get("pid"), arguments.get("process_name", "")),
+                describes="the process is no longer consuming that memory",
+            ),
+            risk="Stops the process immediately. Anything it had not saved is lost, and a "
+                 "process that is merely busy would also be stopped.",
         ),
         Repair(
             name="clear_windows_temp",

@@ -301,7 +301,7 @@ class Applier:
             return None
         if not result.succeeded or result.data is None:
             return None
-        return check.evaluate(result.data)
+        return check.evaluate(result.data, arguments)
 
     def _progress(self, event: str, detail: dict) -> None:
         try:

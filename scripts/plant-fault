@@ -10,6 +10,7 @@
 #   scripts/plant-fault printing          stop the print spooler
 #   scripts/plant-fault clock             stop the Windows time service
 #   scripts/plant-fault display           stop the themes service
+#   scripts/plant-fault memory            start a process that eats 1.5 GB
 #   scripts/plant-fault reset             put everything back
 #
 #   SQUASH_EVAL_INSTANCE   EC2 instance id of the endpoint (default below)
@@ -83,9 +84,35 @@ display)
   plant Themes "the themes service is stopped" \
     "The desktop looks wrong on this computer, fonts and window styling are broken."
   ;;
+memory)
+  # A copy of powershell.exe under an application-like name, holding a fixed
+  # allocation. Running it under its own name matters: the target of a repair
+  # must be something safe to stop, and "powershell" is neither identifiable
+  # nor safe when the agent itself runs scripts through it.
+  echo "Starting a memory-hungry process on $INSTANCE …"
+  run_on_endpoint "\$hog = Join-Path \$env:TEMP 'ReportBuilder.exe';
+Copy-Item \$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe \$hog -Force;
+Start-Process \$hog -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','\$b = New-Object byte[] 1610612736; for (\$i = 0; \$i -lt \$b.Length; \$i += 4096) { \$b[\$i] = 1 }; Start-Sleep -Seconds 7200';
+Start-Sleep -Seconds 12;
+Get-Process ReportBuilder -ErrorAction SilentlyContinue | Select-Object Name,Id,@{N='MemoryMB';E={[int](\$_.WorkingSet64/1MB)}} | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
+  cat <<'EOF'
+
+Planted: a process called ReportBuilder holding about 1.5 GB
+
+Now open the dashboard, go to Investigations, choose this device and paste:
+
+  This computer has become very slow and unresponsive since this morning.
+
+The investigation has not been told what is wrong. It will collect evidence,
+propose a fix, and wait for you to approve it.
+EOF
+  ;;
 reset)
   echo "Restoring services on $INSTANCE …"
-  run_on_endpoint "foreach (\$s in '${SERVICES// /','}') { Start-Service \$s -ErrorAction SilentlyContinue }; Get-Service ${SERVICES// /,} | Select-Object Name,Status | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
+  run_on_endpoint "Get-Process ReportBuilder -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue;
+Remove-Item (Join-Path \$env:TEMP 'ReportBuilder.exe') -Force -ErrorAction SilentlyContinue;
+foreach (\$s in '${SERVICES// /','}') { Start-Service \$s -ErrorAction SilentlyContinue };
+Get-Service ${SERVICES// /,} | Select-Object Name,Status | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
   ;;
 *)
   sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
