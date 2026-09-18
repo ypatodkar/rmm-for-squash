@@ -248,8 +248,19 @@ async def list_devices(operator: str = Depends(require_operator)) -> list[dict]:
             "enrolledAt": row["enrolled_at"],
             "lastSeenAt": row["last_seen_at"],
             "revoked": bool(row["revoked"]),
+            "lastBootAt": row["last_boot_at"],
+            "uptimeSeconds": round(time.time() - row["last_boot_at"])
+                             if row["last_boot_at"] else None,
         })
     return out
+
+
+@app.get("/api/devices/{device_id}/events")
+async def device_events(device_id: str, limit: int = Query(default=50, ge=1, le=500),
+                        operator: str = Depends(require_operator)) -> list[dict]:
+    if store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown device.")
+    return store.device_events(device_id, limit)
 
 
 @app.post("/api/devices/{device_id}/revoke")
@@ -412,6 +423,7 @@ async def agent_connect(websocket: WebSocket) -> None:
     )
     store.touch_device(device_id)
     store.audit("device", "connect.success", device_id=device_id)
+    record_connection(device, hello)
     log.info("device %s (%s) authenticated", device_id, connection.hostname)
 
     await websocket.send_json(hello_ack(device_id, HEARTBEAT_INTERVAL_SECONDS))
@@ -430,8 +442,84 @@ async def agent_connect(websocket: WebSocket) -> None:
                 await websocket.close(code=4403, reason="revoked")
     finally:
         registry.remove(device_id, connection)
+        store.set_disconnected(device_id)
+        store.record_device_event(device_id, "offline", {"reason": "connection closed"})
         store.audit("device", "disconnect", device_id=device_id)
         log.info("device %s disconnected", device_id)
+
+
+# Boot time is derived from an uptime counter, so successive reports of the same
+# boot differ by a little. Only a gap larger than this is treated as a new boot.
+BOOT_TIME_TOLERANCE_SECONDS = 120.0
+# A machine claiming to have booted in the future, or before this software
+# existed, is reporting a broken clock or lying. Either way the value is not
+# usable, and a far-future value would otherwise poison every later comparison.
+BOOT_TIME_FLOOR = 1_577_836_800.0   # 2020-01-01Z
+BOOT_TIME_FUTURE_SLACK_SECONDS = 300.0
+
+
+def parse_reported_boot_time(value: object) -> float | None:
+    """Endpoint-reported boot time, rejected unless it is plausible."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = value / 1000
+    if seconds < BOOT_TIME_FLOOR:
+        return None
+    if seconds > time.time() + BOOT_TIME_FUTURE_SLACK_SECONDS:
+        return None
+    return seconds
+
+
+def record_connection(device: dict, hello: dict) -> None:
+    """Records what reconnecting tells us, and no more. A device returning with
+    the same boot time means only that no new boot was observed -- it could have
+    been a network interruption, an agent restart or a control plane restart.
+    A later boot time means the endpoint reports having started again."""
+    device_id = device["device_id"]
+    boot_at = parse_reported_boot_time(hello.get("bootTimeUnixMs"))
+
+    previous_boot = device.get("last_boot_at")
+    unreachable_for = None
+    if device.get("last_disconnect_at"):
+        unreachable_for = round(time.time() - device["last_disconnect_at"], 1)
+
+    if boot_at is None:
+        store.record_device_event(device_id, "online",
+                                  {"bootTimeReported": False,
+                                   "secondsUnreachable": unreachable_for})
+        return
+
+    store.set_boot_time(device_id, boot_at)
+
+    drift = boot_at - previous_boot if previous_boot is not None else None
+
+    # A boot time moving backwards is not a reboot; it means the endpoint's
+    # clock changed. Record it rather than silently treating it as normal.
+    if drift is not None and drift < -BOOT_TIME_TOLERANCE_SECONDS:
+        store.record_device_event(device_id, "boot_time_regressed", {
+            "previousBootAt": previous_boot, "bootAt": boot_at,
+            "secondsUnreachable": unreachable_for,
+        })
+        log.warning("device %s reported an earlier boot time than before", device_id)
+        return
+
+    if drift is not None and drift > BOOT_TIME_TOLERANCE_SECONDS:
+        store.record_device_event(device_id, "rebooted", {
+            "previousBootAt": previous_boot,
+            "bootAt": boot_at,
+            # What the control plane can actually measure: how long the device
+            # was out of contact. Windows may have been down for less.
+            "secondsUnreachable": unreachable_for,
+        })
+        store.audit("system", "device.rebooted", device_id=device_id,
+                    detail={"secondsUnreachable": unreachable_for})
+        log.info("device %s returned after a new boot (unreachable %ss)",
+                 device_id, unreachable_for)
+    else:
+        store.record_device_event(device_id, "online", {
+            "newBootObserved": False,
+            "secondsUnreachable": unreachable_for,
+        })
 
 
 def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:

@@ -60,6 +60,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency
     ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 
+CREATE TABLE IF NOT EXISTS device_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    event     TEXT NOT NULL,
+    at        REAL NOT NULL,
+    detail    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_device_events ON device_events(device_id, at DESC);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     at        REAL NOT NULL,
@@ -98,6 +107,10 @@ class Store:
             "devices": [
                 ("rebound_at", "REAL"),
                 ("rebind_count", "INTEGER NOT NULL DEFAULT 0"),
+                # Unix seconds, UTC. Reported by the endpoint, so treated as a
+                # claim about that machine rather than as authoritative time.
+                ("last_boot_at", "REAL"),
+                ("last_disconnect_at", "REAL"),
             ],
         }
         for table, columns in additions.items():
@@ -228,6 +241,37 @@ class Store:
                 "SELECT * FROM devices ORDER BY hostname"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- device events ----------
+
+    def record_device_event(self, device_id: str, event: str, detail: dict | None = None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO device_events (device_id, event, at, detail) VALUES (?,?,?,?)",
+                (device_id, event, time.time(), json.dumps(detail) if detail else None),
+            )
+            self._db.commit()
+
+    def device_events(self, device_id: str, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT event, at, detail FROM device_events"
+                " WHERE device_id = ? ORDER BY at DESC LIMIT ?", (device_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_boot_time(self, device_id: str, boot_at: float) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE devices SET last_boot_at = ? WHERE device_id = ?", (boot_at, device_id))
+            self._db.commit()
+
+    def set_disconnected(self, device_id: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE devices SET last_disconnect_at = ? WHERE device_id = ?",
+                (time.time(), device_id))
+            self._db.commit()
 
     def touch_device(self, device_id: str) -> None:
         with self._lock:

@@ -86,6 +86,28 @@
   .jobs-pagination nav { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
   .jobs-error { color: var(--err); font-size: 12px; }
   .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+  .activity { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: #11151c; }
+  .activity[hidden] { display: none; }
+  .activity-head { display: flex; align-items: center; gap: 10px; }
+  .activity-indicator { width: 16px; height: 16px; border: 2px solid var(--muted); border-radius: 50%; flex: none; }
+  .activity[data-tone="working"] .activity-indicator { border-color: #293d5b; border-top-color: var(--accent); animation: activity-spin .9s linear infinite; }
+  .activity[data-tone="success"] .activity-indicator { border-color: var(--ok); background: rgba(63,185,80,.15); }
+  .activity[data-tone="error"] .activity-indicator { border-color: var(--err); background: rgba(248,81,73,.15); }
+  .activity[data-tone="paused"] .activity-indicator { border-color: var(--warn); }
+  .activity-title { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; }
+  .activity-elapsed { flex: none; color: var(--muted); font: 11px var(--mono); font-variant-numeric: tabular-nums; }
+  .activity-context { margin: 5px 0 0 26px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+  .activity details { margin: 10px 0 0 26px; }
+  .activity summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .activity summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .activity-events { list-style: none; margin: 10px 0 0; padding: 0; max-height: 150px; overflow: auto; }
+  .activity-events li { display: flex; gap: 10px; padding: 5px 0; color: var(--muted); font-size: 12px; }
+  .activity-events li:last-child { color: var(--text); }
+  .activity-events time { flex: none; width: 46px; padding-top: 2px; font: 10px var(--mono); color: var(--muted); }
+  .activity-events span { min-width: 0; overflow-wrap: anywhere; }
+  .activity-retry { margin: 10px 0 0 26px; padding: 5px 10px; background: #223149; }
+  @keyframes activity-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .activity-indicator { animation: none !important; } }
 </style>
 </head>
 <body>
@@ -135,6 +157,19 @@
         <span class="chip" data-s="Get-CimInstance Win32_OperatingSystem | Select-Object LastBootUpTime | Format-List | Out-String">last boot</span>
         <span class="chip" data-s="Start-Sleep -Seconds 60">force timeout</span>
       </div>
+      <section id="activity" class="activity" data-tone="working" aria-label="Command activity" hidden>
+        <div class="activity-head">
+          <span class="activity-indicator" aria-hidden="true"></span>
+          <span id="activity-title" class="activity-title" role="status" aria-live="polite"></span>
+          <span id="activity-elapsed" class="activity-elapsed" title="Time observed by this browser"></span>
+        </div>
+        <p id="activity-context" class="activity-context"></p>
+        <details open>
+          <summary>Activity</summary>
+          <ol id="activity-events" class="activity-events" aria-label="Command progress"></ol>
+        </details>
+        <button id="activity-retry" class="activity-retry" type="button" hidden>Check job status</button>
+      </section>
       <pre id="output">Select a device, then run a command.</pre>
     </div>
 
@@ -187,6 +222,10 @@ let resetJobsScroll = false;
 let searchTimer;
 let deviceNames = new Map();
 let latestPoll = 0;
+let commandBusy = false;
+let currentDevices = [];
+let activityRun = null;
+let activityClock;
 
 const $ = (id) => document.getElementById(id);
 const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,
@@ -202,12 +241,27 @@ $("apikey").oninput = () => {
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}), "X-API-Key": $("apikey").value.trim() };
   const res = await fetch(path, { ...opts, headers });
-  if (res.status === 401) throw new Error("unauthorized — check API key");
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  if (!res.ok) {
+    const detail = res.status === 401 ? "unauthorized — check API key"
+      : (await res.json().catch(() => ({}))).detail || res.statusText;
+    const error = new Error(detail);
+    error.status = res.status;
+    throw error;
+  }
   return res.json();
 }
 
+function formatUptime(seconds) {
+  if (seconds == null) return "unknown";
+  const d = Math.floor(seconds / 86400), h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
 function renderDevices(list) {
+  currentDevices = list;
   const el = $("devices");
   if (!list.length) {
     el.innerHTML = '<div class="empty">No devices enrolled.</div>';
@@ -226,6 +280,7 @@ function renderDevices(list) {
       <span>
         <div class="dname">${escapeHtml(d.hostname)}</div>
         <div class="dmeta">${escapeHtml(String(d.osVersion ?? "").slice(0, 28))} · ${escapeHtml(d.secondsSinceLastSeen)}s</div>
+        <div class="dmeta">up ${escapeHtml(formatUptime(d.uptimeSeconds))}</div>
       </span>
     </div>`).join("");
 
@@ -240,8 +295,135 @@ function renderDevices(list) {
       poll();
     });
 
-  $("run").disabled = !list.find(d => d.deviceId === selected)?.online;
+  updateRunButton();
 }
+
+function updateRunButton() {
+  $("run").disabled = commandBusy || !currentDevices.find(d => d.deviceId === selected)?.online;
+}
+
+function activityElapsed(run) {
+  return `${((performance.now() - run.startedAt) / 1000).toFixed(1)}s`;
+}
+
+function showActivity(run, state, title, tone = "working") {
+  if (run.state === state) return;
+  $("activity").dataset.tone = tone;
+  $("activity-title").textContent = title;
+  run.state = state;
+  const list = $("activity-events");
+  const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
+  const entry = document.createElement("li");
+  const time = document.createElement("time");
+  time.dateTime = new Date().toISOString();
+  time.textContent = activityElapsed(run);
+  const text = document.createElement("span");
+  text.textContent = title;
+  entry.append(time, text);
+  list.append(entry);
+  if (atBottom) list.scrollTop = list.scrollHeight;
+}
+
+function startActivityClock(run) {
+  clearInterval(activityClock);
+  const tick = () => { $("activity-elapsed").textContent = `${activityElapsed(run)} elapsed`; };
+  tick();
+  activityClock = setInterval(tick, 100);
+}
+
+function beginActivity(deviceId) {
+  const run = { deviceId, deviceName: deviceNames.get(deviceId) || deviceId, startedAt: performance.now(), jobId: null, state: null };
+  activityRun = run;
+  $("activity").hidden = false;
+  $("activity-events").replaceChildren();
+  $("activity-retry").hidden = true;
+  $("activity-context").textContent = run.deviceName;
+  startActivityClock(run);
+  showActivity(run, "Submitting", "Sending command to the control plane…");
+  return run;
+}
+
+function showJobActivity(run, job) {
+  const titles = {
+    Queued: "Command queued; waiting for dispatch…",
+    Dispatched: "Command dispatched; waiting for the Windows agent…",
+    Running: "Windows agent accepted the command; waiting for its result…",
+    Completed: job.exitCode === 0 ? "Command completed" : `Command finished${job.exitCode == null ? "" : ` with exit code ${job.exitCode}`}`,
+    TimedOut: "Command timed out",
+    Unreachable: "Windows agent became unreachable",
+    Failed: "Command failed",
+  };
+  const terminal = ["Completed", "TimedOut", "Unreachable", "Failed"].includes(job.state);
+  const tone = terminal ? (job.state === "Completed" && job.exitCode === 0 ? "success" : "error") : "working";
+  showActivity(run, job.state, titles[job.state] || `Job status: ${job.state}`, tone);
+  return terminal;
+}
+
+function showCommandResult(run, result) {
+  const overhead = (result.roundTripMs != null && result.durationMs != null)
+    ? Math.max(0, result.roundTripMs - result.durationMs) : null;
+  $("output").textContent =
+    `state       ${result.state}\n` +
+    `exit        ${result.exitCode ?? "—"}\n` +
+    `exec        ${result.durationMs ?? "—"}ms   (on the endpoint)\n` +
+    `round-trip  ${result.roundTripMs ?? "—"}ms   (server-measured dispatch to result)\n` +
+    `overhead    ${overhead ?? "—"}ms   (everything this system adds)\n` +
+    `${"─".repeat(52)}\n${result.stdout || ""}${result.stderr ? "\nSTDERR\n" + result.stderr : ""}` +
+    `${result.error ? "\nERROR: " + result.error : ""}`;
+  $("timing").textContent = `${Math.round(performance.now() - run.startedAt)}ms as seen from this browser`;
+}
+
+async function watchCommand(run) {
+  // A short long-poll returns terminal results immediately and exposes current
+  // non-terminal state every 500ms, without inventing intermediate progress.
+  const deadline = performance.now() + 60000;
+  while (performance.now() < deadline) {
+    const result = await api(`/api/jobs/${encodeURIComponent(run.jobId)}?waitMs=500`, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (showJobActivity(run, result)) {
+      showCommandResult(run, result);
+      return;
+    }
+  }
+  throw new Error("The job has not returned a final result yet.");
+}
+
+function pauseActivity(run, error) {
+  if (!run.jobId && error.status >= 400 && error.status < 500) {
+    showActivity(run, "Rejected", "Command request rejected", "error");
+    $("output").textContent = error.message;
+    return;
+  }
+  showActivity(run, "StatusUnavailable", run.jobId
+    ? "Live updates paused; the job may still be running"
+    : "Could not confirm whether the command was accepted", "paused");
+  $("output").textContent = `${error.message}\n\n${run.jobId
+    ? "Check job status to reconnect to this same job. The command will not be sent again."
+    : "Check Recent jobs before submitting again; the server may have received the request."}`;
+  $("activity-retry").hidden = !run.jobId;
+}
+
+function finishWatching() {
+  clearInterval(activityClock);
+  if (activityRun) $("activity-elapsed").textContent = `${activityElapsed(activityRun)} elapsed`;
+  commandBusy = false;
+  updateRunButton();
+  poll();
+}
+
+$("activity-retry").onclick = async () => {
+  if (commandBusy || !activityRun?.jobId) return;
+  const run = activityRun;
+  commandBusy = true;
+  updateRunButton();
+  $("activity-retry").hidden = true;
+  startActivityClock(run);
+  showActivity(run, "Reconnecting", "Checking the existing job…");
+  try { await watchCommand(run); }
+  catch (error) { pauseActivity(run, error); }
+  finally { finishWatching(); }
+};
 
 function renderJobs(list) {
   const scroller = $("jobs-scroll");
@@ -357,36 +539,25 @@ $("jobs-clear").onclick = () => {
 
 $("run").onclick = async () => {
   const script = $("script").value.trim();
-  if (!script || !selected) return;
-  $("run").disabled = true;
-  $("output").textContent = "running…";
+  if (!script || !selected || commandBusy) return;
+  commandBusy = true;
+  updateRunButton();
+  const run = beginActivity(selected);
+  $("output").textContent = "Waiting for the command result…";
   $("timing").textContent = "";
-  const t0 = performance.now();
   try {
-    const { jobId } = await api(`/api/devices/${selected}/jobs`, {
+    const dispatched = await api(`/api/devices/${encodeURIComponent(run.deviceId)}/jobs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ script, timeoutSeconds: 30 }),
+      signal: AbortSignal.timeout(15000),
     });
-    const r = await api(`/api/jobs/${jobId}?waitMs=40000`);
-    const rt = Math.round(performance.now() - t0);
-    const overhead = (r.roundTripMs != null && r.durationMs != null)
-      ? Math.max(0, r.roundTripMs - r.durationMs) : null;
-    $("output").textContent =
-      `state       ${r.state}\n` +
-      `exit        ${r.exitCode ?? "—"}\n` +
-      `exec        ${r.durationMs ?? "—"}ms   (on the endpoint)\n` +
-      `round-trip  ${r.roundTripMs ?? "—"}ms   (server-measured dispatch to result)\n` +
-      `overhead    ${overhead ?? "—"}ms   (everything this system adds)\n` +
-      `${"─".repeat(52)}\n${r.stdout || ""}${r.stderr ? "\nSTDERR\n" + r.stderr : ""}` +
-      `${r.error ? "\nERROR: " + r.error : ""}`;
-    $("timing").textContent = `${rt}ms as seen from this browser`;
-  } catch (e) {
-    $("output").textContent = "Error: " + e.message;
-  } finally {
-    $("run").disabled = false;
-    poll();
-  }
+    run.jobId = dispatched.jobId;
+    $("activity-context").textContent = `${run.deviceName} · Job ${run.jobId}`;
+    showJobActivity(run, dispatched);
+    await watchCommand(run);
+  } catch (error) { pauseActivity(run, error); }
+  finally { finishWatching(); }
 };
 
 document.querySelectorAll(".chip[data-s]").forEach(c =>

@@ -65,13 +65,17 @@ public sealed class AgentWorker(
         var challenge = await WebSocketJson.ReceiveAsync<ServerMessage>(socket, ct) as ServerChallenge
             ?? throw new InvalidOperationException("Server did not issue a challenge.");
 
+        var uptime = TimeSpan.FromMilliseconds(Environment.TickCount64);
+
         await WebSocketJson.SendAsync(socket, (AgentMessage)new AgentHello
         {
             DeviceId = deviceId,
             Hostname = Environment.MachineName,
             OsVersion = RuntimeInformation.OSDescription,
             AgentVersion = AgentVersion,
-            Signature = credential.Sign(Convert.FromBase64String(challenge.Nonce))
+            Signature = credential.Sign(Convert.FromBase64String(challenge.Nonce)),
+            BootTimeUnixMs = DateTimeOffset.UtcNow.Add(-uptime).ToUnixTimeMilliseconds(),
+            UptimeSeconds = (long)uptime.TotalSeconds,
         }, ct);
 
         var ack = await WebSocketJson.ReceiveAsync<ServerMessage>(socket, ct) as ServerHelloAck

@@ -16,6 +16,16 @@ public sealed record AgentHello : AgentMessage
     public required string OsVersion { get; init; }
     public required string AgentVersion { get; init; }
     public required string Signature { get; init; }
+
+    /// <summary>
+    /// When this operating system last started, in UTC. Derived from the
+    /// system uptime counter, so it carries a little jitter between reports and
+    /// must be compared with a tolerance rather than for equality.
+    /// </summary>
+    public long? BootTimeUnixMs { get; init; }
+
+    /// <summary>Seconds since the operating system started.</summary>
+    public long? UptimeSeconds { get; init; }
 }
 
 public sealed record AgentHeartbeat : AgentMessage
