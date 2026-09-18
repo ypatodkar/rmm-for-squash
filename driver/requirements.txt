@@ -1,0 +1,2 @@
+# Milestone 1 uses only the standard library; the model client arrives with the
+# investigation loop.
