@@ -268,6 +268,68 @@ curl -sX POST $HOST/api/devices/$DEVICE/inventory/refresh -H "X-API-Key: $KEY"
 
 **How it's collected.** A fixed, read-only script, sent by the server as an ordinary job under the name `system`. It's signed and time-limited like every other job, and it appears in the job history and audit log (`inventory.collect`). Nothing you send can change the script. Installed software is read from the registry, not from `Win32_Product`, which is slow and makes Windows re-check every installed MSI program. A result that was cut off, or isn't valid JSON, is recorded as a failed collection, never stored as a partial inventory.
 
+### Event logs
+Query a device's Windows event logs, filtered by log, severity and time, and get structured entries back instead of raw text. Event logs change by the second, so nothing is stored: each request runs a fixed, read-only query on the device and returns what it found. The device must be online.
+
+`GET /api/devices/{deviceId}/event-logs`. Every filter is optional:
+
+| Filter | Default | Allowed |
+|---|---|---|
+| `log` | `System` | `System`, `Application`, `Security`, `Setup` |
+| `levels` | `critical,error,warning` | Comma-separated: `critical`, `error`, `warning`, `information`, `verbose` |
+| `since` | 24 hours before `until` | ISO time **with a timezone**, e.g. `2026-09-18T00:00:00Z` |
+| `until` | now | ISO time with a timezone |
+| `maxEvents` | `50` | 1–500 (newest first) |
+| `provider` | none | The source name, e.g. `Service Control Manager` |
+| `eventId` | none | 0–65535, e.g. `7031` |
+
+```bash
+# Errors and warnings from the System log, last 24 hours
+curl -s "$HOST/api/devices/$DEVICE/event-logs" -H "X-API-Key: $KEY"
+
+# Errors in the Application log over a fixed window
+curl -s "$HOST/api/devices/$DEVICE/event-logs?log=Application&levels=error&since=2026-09-18T00:00:00Z&until=2026-09-19T00:00:00Z" \
+  -H "X-API-Key: $KEY"
+
+# One event type from one source
+curl -s "$HOST/api/devices/$DEVICE/event-logs?levels=information&provider=Service%20Control%20Manager&eventId=7036&maxEvents=10" \
+  -H "X-API-Key: $KEY"
+```
+
+```json
+{
+  "deviceId": "c61f63b9…",
+  "hostname": "EC2AMAZ-LP5BJ78",
+  "query": { "log": "System", "levels": ["critical", "error", "warning"],
+             "since": "2026-09-18T12:00:00Z", "until": "2026-09-19T12:00:00Z",
+             "maxEvents": 50, "provider": null, "eventId": null },
+  "count": 1,
+  "entries": [{
+    "timeCreated": "2026-09-19T00:19:24.1234567Z",
+    "level": "warning", "levelNumber": 3,
+    "eventId": 10016, "provider": "Microsoft-Windows-DistributedCOM",
+    "log": "System", "recordId": 4821,
+    "message": "The application-specific permission settings do not grant…",
+    "messageTruncated": false
+  }],
+  "jobId": "…"
+}
+```
+
+- **Nothing found is an empty list** (`"count": 0`), not an error. Windows itself reports "no matching events" as a failure; this API doesn't.
+- **`information` includes Windows level 0.** Every Security audit event (logons and so on) is recorded at level 0, which Event Viewer shows as Information, so without it the Security log would look empty.
+- **Messages are cut at 2,000 characters** (`messageTruncated: true`). An answer cut off as a whole is an error, never a shorter list.
+- **Message text comes from the device, so treat it as untrusted:** display it as text, never as HTML.
+
+| If | You get |
+|---|---|
+| A filter isn't valid | `400`, and nothing is sent to the device |
+| The device isn't enrolled / is revoked / is offline | `404` / `403` / `409` |
+| The device ran the query but it failed | `502`, with the reason |
+| The device didn't answer in time | `504` |
+
+The query runs as an ordinary job under your name, so it's in the job history and the audit log (`eventlog.query`). Every filter is checked and turned into a fixed value on the server before it reaches the script, so nothing you send can become PowerShell.
+
 ---
 
 ## 4. Restarting a Device

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 import auth
+import eventlog
 import inventory
 import protocol
 from jobs import JobStore
@@ -642,6 +643,64 @@ async def refresh_inventory(device_id: str, operator: str = Depends(require_oper
         return {"deviceId": device_id, "collecting": True, "jobId": None}
     dispatched = await start_inventory(device_id)
     return {"deviceId": device_id, "collecting": True, "jobId": dispatched["jobId"]}
+
+
+# ---------- event logs ----------
+# See eventlog.py. Queried live rather than stored: event logs change by the
+# second. The query is a fixed, read-only job built from validated filters, run
+# under the caller's name so the audit log shows who looked.
+
+@app.get("/api/devices/{device_id}/event-logs")
+async def query_event_log(
+    device_id: str,
+    log: str = Query(default="System"),
+    levels: str | None = Query(default=None, max_length=100),
+    since: datetime.datetime | None = Query(default=None),
+    until: datetime.datetime | None = Query(default=None),
+    max_events: int = Query(default=eventlog.DEFAULT_EVENTS, alias="maxEvents"),
+    provider: str | None = Query(default=None),
+    event_id: int | None = Query(default=None, alias="eventId"),
+    operator: str = Depends(require_operator),
+) -> dict:
+    """Structured event log entries from one device, newest first."""
+    try:
+        query = eventlog.make_query(log=log, levels=levels, since=since, until=until,
+                                    max_events=max_events, provider=provider,
+                                    event_id=event_id)
+    except eventlog.QueryError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+    dispatched = await send_to_device(
+        device_id, eventlog.build_script(query),
+        timeout_seconds=eventlog.TIMEOUT_SECONDS, max_output_bytes=eventlog.MAX_OUTPUT_BYTES,
+        operator=operator, idempotency_key=None,
+        action="eventlog.query", detail=query.view())
+
+    job = jobs.get(dispatched["jobId"])
+    if job is not None and not job.state.is_terminal:
+        # The supervisor guarantees a terminal state; this only bounds the wait.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(job.completion),
+                                   timeout=eventlog.TIMEOUT_SECONDS + 15)
+
+    result = jobs.view(dispatched["jobId"]) or {}
+    entries, error = eventlog.parse(result)
+    if error:
+        # 504: the device never answered. 502: it answered, but with a failure.
+        no_answer = result.get("state") in (None, "Queued", "Dispatched", "Running",
+                                            "TimedOut", "Unreachable")
+        raise HTTPException(status_code=504 if no_answer else 502,
+                            detail=f"The device could not answer the query: {error}")
+
+    device = store.get_device(device_id) or {}
+    return {
+        "deviceId": device_id,
+        "hostname": device.get("hostname"),
+        "query": query.view(),
+        "count": len(entries),
+        "entries": entries,
+        "jobId": dispatched["jobId"],
+    }
 
 
 @app.get("/api/jobs/{job_id}")
