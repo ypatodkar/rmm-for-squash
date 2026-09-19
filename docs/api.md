@@ -4,16 +4,18 @@ This API controls Windows devices, runs scripts, and uses AI for diagnostics. Ev
 
 ## The Basics
 
-- **Base URL:** `https://35-173-64-136.sslip.io`
-- **Format:** JSON (camelCase). Times are Unix seconds (except for investigations, which use dates like `2026-09-18T14:02:11Z`).
+- **Base URL:** your deployed control plane, for example `https://35-173-64-136.sslip.io`. Use your own address when following the setup guide.
+- **Format:** JSON, generally camelCase; audit records use snake_case. Server record timestamps usually use Unix seconds. Investigations, event-log entries and filters, and dates inside inventory use ISO timestamps with a timezone. Response examples are illustrative, not live results.
 - **Authentication:** Humans and scripts use `X-API-Key: <your-key>`. A device uses a one-time token only to enroll; afterward it authenticates each connection by signing a server challenge with its private key.
 
 **Setup variables for the examples below:**
 ```bash
 export HOST=https://35-173-64-136.sslip.io
-export KEY=<your-key>
-export DEVICE=<a deviceId from GET /api/devices>
+export KEY="<your-key>"
+export DEVICE="<deviceId from GET /api/devices>"
 ```
+
+Replace the quoted placeholders before running requests. These variables belong to your terminal; in Postman use the complete URL and set the `X-API-Key` header directly. There is no user-signup or login-token endpoint: operator keys are configured on the server.
 
 **Status Codes:**
 - `200` / `201`: Success. 
@@ -71,7 +73,7 @@ iwr "$Server/install.ps1" -OutFile i.ps1
 ```
 
 ### Step 2 — The device enrols
-**The agent software does this automatically.** It redeems the token to register its security keys.
+**The agent software does this automatically.** It redeems the token to register its public key. The private key stays on the endpoint. The following shows the wire request; the installer/agent generates the real device ID and key, so do not manually send the placeholder key.
 
 ```bash
 curl -sX POST $HOST/api/enroll -H 'Content-Type: application/json' -d '{
@@ -80,7 +82,7 @@ curl -sX POST $HOST/api/enroll -H 'Content-Type: application/json' -d '{
   "publicKey": "MFkwEwYHKoZIzj0CAQ…",
   "hostname": "EC2AMAZ-ABC123",
   "osVersion": "Microsoft Windows Server 2022",
-  "agentVersion": "0.2.0"
+  "agentVersion": "0.3.0"
 }'
 ```
 
@@ -93,7 +95,7 @@ curl -sX POST $HOST/api/enroll -H 'Content-Type: application/json' -d '{
 ## 3. Managing Devices
 
 ### List all devices
-Shows online status (`online` means it pinged the server in the last 30 seconds), OS, and uptime.
+Shows online status (`online` means a current, non-revoked connection with a message received within the last 30 seconds), OS, and uptime. Heartbeats normally arrive every 10 seconds.
 
 ```bash
 curl -s $HOST/api/devices -H "X-API-Key: $KEY"
@@ -104,7 +106,7 @@ curl -s $HOST/api/devices -H "X-API-Key: $KEY"
   "deviceId": "a1b2c3…",
   "hostname": "EC2AMAZ-ABC123",
   "osVersion": "Microsoft Windows Server 2022",
-  "agentVersion": "0.2.0",
+  "agentVersion": "0.3.0",
   "online": true,
   "secondsSinceLastSeen": 3.2,
   "enrolledAt": 1758140000.0,
@@ -132,7 +134,7 @@ curl -s "$HOST/api/devices/$DEVICE/events?limit=20" -H "X-API-Key: $KEY"
 ```
 
 ### Kick a device
-Instantly kills the connection and cancels pending work.
+Closes the connection, discards undispatched work for it, and marks outstanding jobs `Unreachable`. This does not roll back commands already executed or prove that an already-running endpoint process stopped.
 
 ```bash
 curl -sX POST $HOST/api/devices/$DEVICE/revoke -H "X-API-Key: $KEY"
@@ -178,14 +180,15 @@ Publish the new `SquashRmm.Agent.exe` and its `.sha256` to the server **before**
 
 Same checks as any job: `404` if not enrolled, `403` if revoked, `409` if offline. Shows up in the audit log as `device.upgrade`, and in device history as `upgrade_requested`.
 
-From the CLI, which also waits for the agent to come back:
+From the project root, the CLI also waits for the agent to come back:
 
 ```bash
-squashctl upgrade WIN-DEMO-1
+scripts/squashctl upgrade WIN-DEMO-1
 ```
 
 ### Device inventory
-What each machine is: OS version and build, hardware, installed software and last boot time. The server collects it itself, so reading it never runs anything on the machine:
+What each machine is: OS version and build, hardware, installed software and last boot time. The server collects it itself, so a GET returns the stored snapshot without dispatching a new job. Collection runs:
+
 - when a device connects and hasn't been collected in the last 6 hours
 - straight away after a reboot
 - every 6 hours while it's online
@@ -238,7 +241,7 @@ curl -s $HOST/api/devices/$DEVICE/inventory -H "X-API-Key: $KEY"
       { "name": "Amazon SSM Agent", "version": "3.3.5226.0",
         "publisher": "Amazon Web Services", "installedOn": null }
     ],
-    "softwareCount": 6
+    "softwareCount": 1
   }
 }
 ```
@@ -264,12 +267,12 @@ curl -sX POST $HOST/api/devices/$DEVICE/inventory/refresh -H "X-API-Key: $KEY"
 { "deviceId": "c61f63b9…", "collecting": true, "jobId": "…" }
 ```
 
-`202`: collection has started. It usually takes about 3 seconds; read the result back with `GET`, where `collectedAt` changes. If one is already running you get `"jobId": null` and nothing new is sent. Same checks as any job: `404` if the device isn't enrolled, `403` if revoked, `409` if offline.
+`202`: collection has started. Read the result back with `GET` until `collecting` is false and `collectedAt` changes; execution time depends on the device. If one is already running you get `"jobId": null` and nothing new is sent. Same checks as any job: `404` if the device isn't enrolled, `403` if revoked, `409` if offline.
 
 **How it's collected.** A fixed, read-only script, sent by the server as an ordinary job under the name `system`. It's signed and time-limited like every other job, and it appears in the job history and audit log (`inventory.collect`). Nothing you send can change the script. Installed software is read from the registry, not from `Win32_Product`, which is slow and makes Windows re-check every installed MSI program. A result that was cut off, or isn't valid JSON, is recorded as a failed collection, never stored as a partial inventory.
 
 ### Event logs
-Query a device's Windows event logs, filtered by log, severity and time, and get structured entries back instead of raw text. Event logs change by the second, so nothing is stored: each request runs a fixed, read-only query on the device and returns what it found. The device must be online.
+Query a device's Windows event logs, filtered by log, severity and time, and get structured entries back instead of raw text. Each request runs a live, fixed, read-only query on the device and returns what it found. There is no separate event-log cache, but the execution and its output are retained in ordinary job history. The device must be online.
 
 `GET /api/devices/{deviceId}/event-logs`. Every filter is optional:
 
@@ -284,7 +287,7 @@ Query a device's Windows event logs, filtered by log, severity and time, and get
 | `eventId` | none | 0–65535, e.g. `7031` |
 
 ```bash
-# Errors and warnings from the System log, last 24 hours
+# Critical events, errors and warnings from the System log, last 24 hours
 curl -s "$HOST/api/devices/$DEVICE/event-logs" -H "X-API-Key: $KEY"
 
 # Errors in the Application log over a fixed window
@@ -334,7 +337,7 @@ The query runs as an ordinary job under your name, so it's in the job history an
 
 ## 4. Restarting a Device
 
-Schedule a secure restart. The `reason` accepts a restricted set of ordinary printable characters; command separators and other unsafe characters are rejected. Minimum delay is 5 seconds.
+Schedule a restart; the endpoint waits for a pending-reboot check before dispatching the restart job. The `reason` accepts a restricted set of ordinary printable characters; command separators and other unsafe characters are rejected. Delay must be 5–3,600 seconds; the default is 15.
 
 ```bash
 # Default: 15 seconds from now
@@ -354,12 +357,12 @@ curl -sX POST $HOST/api/devices/$DEVICE/restart \
 { "jobId": "…", "state": "Dispatched", "restartAt": 1758230520.0, "delaySeconds": 120 }
 ```
 
-From the CLI, where `restart` and `reboot` are the same command:
+From the project root, where `restart` and `reboot` are the same CLI command:
 
 ```bash
-squashctl restart WIN-DEMO-1                    # prompts for the hostname, 15s
-squashctl reboot  WIN-DEMO-1 --in 120 --reason 'Monthly patch window'
-squashctl restart WIN-DEMO-1 --yes              # no prompt, for scripts
+scripts/squashctl restart WIN-DEMO-1                    # prompts for the hostname, 15s
+scripts/squashctl reboot  WIN-DEMO-1 --in 120 --reason 'Monthly patch window'
+scripts/squashctl restart WIN-DEMO-1 --yes              # no prompt, for scripts
 ```
 
 Without `--yes` it asks you to type the device name, and refuses outright if there is no terminal to ask at, so a restart cannot happen by accident in a pipeline.
@@ -397,7 +400,7 @@ curl -s "$HOST/api/devices/$DEVICE/restarts?limit=5" -H "X-API-Key: $KEY"
   "delaySeconds": 15,
   "reason": "Restart requested from Squash RMM",
   "jobId": "…",
-  "pendingRebootBefore": { "pending": true, "reasons": [ … ] },
+  "pendingRebootBefore": { "pending": true, "reasons": [{ "code": "windows_update", "description": "Windows Update has installed updates that need a restart" }] },
   "pendingCheckError": null,
   "scheduledAt": 1758242001.9,
   "wentOfflineAt": 1758242017.4,
@@ -434,7 +437,7 @@ curl -s $HOST/api/devices/$DEVICE/pending-reboot -H "X-API-Key: $KEY"
   "checkedAt": 1758242000.4, "jobId": "…" }
 ```
 
-It checks, read-only, every place Windows records that it needs a restart:
+It checks these common Windows pending-reboot indicators, read-only:
 
 | `code` | What Windows is waiting for |
 |---|---|
@@ -475,15 +478,16 @@ curl -sX POST $HOST/api/devices/$DEVICE/jobs \
 | `maxOutputBytes` | `1048576` | 1,024 – 4,194,304 (4 MiB), per stream, counted in UTF-8 bytes |
 | `idempotencyKey` | none | Optional |
 
-Sending the same request again with the same `idempotencyKey` returns the original job with `"state": "Duplicate"` and runs nothing. Reusing a key for a **different** request (another script, device, timeout or operator) returns `409` rather than someone else's job.
+Sending the same request again with the same `idempotencyKey` returns the original job with `"state": "Duplicate"` and runs nothing. Reusing a key for a **different** script, device, timeout or operator returns `409`. `maxOutputBytes` is not part of this comparison: changing only that field still returns the original job. Without an idempotency key, each POST creates a new job.
 
 ### Check the results
-Use `waitMs` to wait for the script to finish without spamming the server. 
+Copy `jobId` from the dispatch response into `JOB`. Use a positive `waitMs` value in milliseconds (for example 20,000; default 0) for a bounded wait; the response can still be nonterminal when that wait ends.
 **Note:** `Completed` just means it ran. Always check the `exitCode`. Do not trust output if `stdoutTruncated` is true.
 
 The server checks every result before storing it: `exitCode` and `durationMs` must be whole numbers and `state` must be a finished state, or the job becomes `Failed` with `"error": "Result rejected: malformed result: …"`. Output longer than `maxOutputBytes` is cut there and flagged, even if an agent sent more.
 
 ```bash
+export JOB="<jobId from the dispatch response>"
 curl -s "$HOST/api/jobs/$JOB?waitMs=20000" -H "X-API-Key: $KEY"
 ```
 
@@ -505,6 +509,25 @@ curl -s "$HOST/api/jobs/$JOB?waitMs=20000" -H "X-API-Key: $KEY"
 }
 ```
 
+`durationMs` measures endpoint execution. `roundTripMs` measures server dispatch to completion; it excludes client request latency and model reasoning. A control-plane restart marks unfinished jobs `Failed`; they are not blindly dispatched again.
+
+### Timeout and offline examples
+
+On an online test device, run a script that exceeds its time limit:
+
+```bash
+curl -sX POST "$HOST/api/devices/$DEVICE/jobs" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"script":"Start-Sleep -Seconds 30","timeoutSeconds":3}'
+```
+
+Fetch the returned job ID to observe `TimedOut`. For the offline case, run
+`Stop-Service SquashEndpoint` in Administrator PowerShell on that test device,
+wait for `GET /api/devices` to report it offline, and send a new jobs request.
+It returns HTTP 409 with `Device '<id>' is not reachable.` Restore the agent
+with `Start-Service SquashEndpoint` on Windows. Offline requests do not create
+a job queued for later execution.
+
 ### Browse job history
 
 ```bash
@@ -517,11 +540,11 @@ curl -s "$HOST/api/jobs?page=1&pageSize=30&state=Completed&search=Spooler" \
 ```
 
 ```json
-{ "items": [ … ], "total": 412, "page": 1, "pageSize": 30, "totalPages": 14 }
+{ "items": [], "total": 0, "page": 1, "pageSize": 30, "totalPages": 1 }
 ```
 
 ### The audit log
-Shows all state changes (row names are snake_case).
+Shows recorded operator actions and execution events (row names are snake_case), including dispatches, results, approvals, and refusals. Exact scripts and results are available in job history.
 
 ```bash
 curl -s "$HOST/api/audit?limit=50" -H "X-API-Key: $KEY"
@@ -553,11 +576,11 @@ curl -s "$HOST/api/investigations?page=1&pageSize=30&status=active" \
 ```
 
 ```json
-{ "items": [ … ], "page": 1, "totalPages": 1, "total": 2 }
+{ "items": [], "page": 1, "totalPages": 1, "total": 0 }
 ```
 
 ### Step 1 — Report a problem
-Describe the symptoms the user is seeing, not your guessed cause.
+Describe the symptoms the user is seeing, not your guessed cause. `problem` must be 10–4,000 characters; `requestId` is required (1–128 characters). Reusing the same request ID and operator with the same device/problem returns the existing investigation; conflicting reuse returns `409`. Use a new request ID for a fresh investigation.
 
 ```bash
 curl -sX POST $HOST/api/investigations \
@@ -574,7 +597,7 @@ curl -sX POST $HOST/api/investigations \
 ```
 
 ### Step 2 — Check the progress
-Status flows like this: `queued` ➔ `investigating` ➔ `planning` ➔ `awaiting_approval`.
+Status normally progresses through `queued` ➔ `investigating` ➔ `planning` ➔ `awaiting_approval`. If no repair applies, it ends as `completed`; an unsuccessful investigation can end as `failed`. Replace the example ID below with the actual `investigationId` returned by the POST.
 
 ```bash
 curl -s $HOST/api/investigations/inv-abc123 -H "X-API-Key: $KEY"
@@ -621,7 +644,7 @@ Once it reaches `awaiting_approval`, you will see the evidence and the proposed 
 ```
 
 ### Step 3 — Approve or reject
-You must include the `proposalHash` to prove you are approving the most current plan. If the device's situation changed while you were reading, it will reject your approval and require you to review the new data.
+Copy `proposalId`, `proposalHash`, and `deviceId` from the proposal you actually reviewed; `proposalHash` is different from `scriptSha256`. Approval binds that exact proposal to its device. Proposals expire after 15 minutes. A mismatched, expired, or non-actionable approval returns `409`. After approval is recorded, the background executor separately rechecks the current device condition and may refuse to apply the repair if it no longer fits.
 
 ```bash
 curl -sX POST $HOST/api/investigations/inv-abc123/decision \
@@ -634,7 +657,7 @@ curl -sX POST $HOST/api/investigations/inv-abc123/decision \
       }'
 ```
 
-Reject with the same body and `"decision": "reject"`.
+Reject instead with the same binding fields and `"decision": "reject"`. Repeating the same decision is idempotent; changing a recorded decision returns `409`. A no-action proposal cannot be approved.
 
 ### Step 4 — Poll for the final result
 The decision endpoint returns immediately. Continue fetching the investigation while an approved repair is `applying` or `verifying`:
@@ -643,7 +666,7 @@ The decision endpoint returns immediately. Continue fetching the investigation w
 curl -s $HOST/api/investigations/inv-abc123 -H "X-API-Key: $KEY"
 ```
 
-`resolved` means the repair ran and its verification check passed. `unresolved` means the repair or verification did not establish success. `failed` reports an execution error, `rejected` records an operator rejection, and `completed` means the planner found no appropriate automated repair. The final response includes an `outcome` object with the repair and verification job IDs, whether the repair was applied, the verification result, and a human-readable detail.
+`resolved` means the repair ran and its verification check passed. `unresolved` means the repair was applied but verification returned false or could not confirm success. `failed` covers investigation errors and repairs that were refused or could not be applied. `rejected` records an operator rejection, and `completed` means the planner found no appropriate automated repair. After a repair attempt, `outcome` contains `applied`, `resolved` (true, false, or null), `detail`, and the repair `jobId`. A separate verification job ID is not exposed in this object.
 
 ---
 
@@ -652,15 +675,15 @@ curl -s $HOST/api/investigations/inv-abc123 -H "X-API-Key: $KEY"
 The agent initiates the connection (allowing it to work behind NATs). 
 `WS /agent/connect`
 
-**Handshake:**
-```json
+**Handshake (schematic):**
+```text
 1. server → {"type":"challenge","nonce":"…"}
 2. device → {"type":"hello","deviceId":"…","signature":"<nonce signed>","hostname":"…","osVersion":"…","agentVersion":"…","bootTimeUnixMs":…,"uptimeSeconds":…}
 3. server → {"type":"hello_ack","deviceId":"…","heartbeatIntervalSeconds":10}
 ```
 
-**Steady State:**
-```json
+**Steady State (schematic):**
+```text
 // device →
 {"type":"heartbeat"} // (every 10 seconds)
 

@@ -42,7 +42,7 @@ with a fresh server challenge that the device must sign. The MachineGuid-based
 device ID is only an identifier and is never accepted as proof.
 
 Enrollment tokens are random, stored as hashes, expire after one hour and can
-be redeemed only once. The installer removes the token after enrollment. An
+be redeemed only once. The agent removes the token after enrollment. An
 ordinary token cannot replace an enrolled device's key; recovery requires a
 token pinned to that device. Revoked devices cannot reconnect or re-enroll
 until an operator restores them, and rejected attempts are audited.
@@ -81,21 +81,23 @@ Timeouts at both ends and an offline supervisor move every accepted job to a
 terminal state. When supplied, an idempotency key makes a repeated identical
 dispatch return the original job and rejects reuse for a different request.
 One serialized WebSocket sender prevents heartbeat and result frames from
-interleaving. Revocation closes the socket and fails outstanding work.
+interleaving. Revocation closes the socket and fails outstanding job records; it does not
+roll back work already executed. The control plane runs as a single instance
+with one worker because device connections and active jobs are process-local.
 
 ## Deferred risks
 
 | Gap | Why deferred and the next step |
 |---|---|
 | A compromised control plane can command the fleet | This is the central trusted host. Add agent-pinned job signing and quorum approval for high-risk work. |
-| Operator keys are static and fleet-wide | The demo has one operator. Add SSO, short-lived scoped roles and device groups; replace dashboard `localStorage` with an HttpOnly session. |
+| Operator keys, including the AI driver key, are static and fleet-wide | The demo has one operator. Catalogue restrictions are application-level, not a separate API permission scope. Add SSO, short-lived scoped roles and device groups; replace dashboard `localStorage` with an HttpOnly session. |
 | The audit log shares the SQLite database | An attacker controlling the server can alter it. Hash-chain records and stream them to external storage. |
 | The binary hash comes from the same server | It detects corruption, not a malicious server. Authenticode-sign releases and verify the signer. |
 | No rate limiting on enrollment or failed-key attempts | Tokens and keys have 256 bits of entropy. Add per-IP limits and alerts before production. |
 | A captured unused enrollment token can enroll the first machine that redeems it | Single use and expiry make this short-lived and cause the intended install to fail loudly, but do not prevent it. Add pending enrollment: compare the device-key fingerprint through the trusted deployment channel before enabling jobs. |
 | A lost enrollment response strands the agent | The device was registered but the token was consumed. Let a registered key confirm enrollment by signing a new challenge. |
 | Cloned VMs share `MachineGuid` | A clone still lacks the enrolled private key. Detect duplicate IDs and optionally use a TPM-backed key. |
-| Endpoint output is stored verbatim and may be sent to OpenAI | Exact output is useful for audit, while diagnostics avoid user files. Add view-time field redaction and use a provider under an appropriate data agreement. |
+| Endpoint output, including event-log query results, is stored in job history and diagnostic evidence may be sent to OpenAI | Exact output is useful for audit, while diagnostics avoid user files. Add view-time field redaction and use a provider under an appropriate data agreement. |
 | Result signatures omit state and truncation flags | Those fields are validated and output is capped server-side. Version the signed payload and include both fields. |
 | A model may still follow instructions in untrusted text | Fences only reduce the risk. Catalogue-only capabilities, a fixed device, human approval and visible raw evidence limit the effect. |
 

@@ -1,7 +1,7 @@
 # Setup guide
 
-This takes about 20 minutes. Most of it is the first `dotnet publish`
-downloading the Windows runtime.
+Allow about 20–30 minutes with the prerequisites installed. The first
+`dotnet publish` downloads the Windows runtime; download time varies.
 
 ## What you need
 
@@ -32,6 +32,8 @@ Edit `.env`:
 - Put your key in the `operator:` entry of `SQUASH_OPERATOR_KEYS`, and the second
   key in both the `ai-driver:` entry and `SQUASH_DRIVER_KEY`.
 - Set `OPENAI_API_KEY` if you want investigations.
+- Keep `SQUASH_SELF_URL=http://127.0.0.1:5200` for the server's own AI worker.
+  Change it if you change the server port. The default model is `gpt-4.1`.
 
 ## 3. Build the agent and put it where the server serves it
 
@@ -54,8 +56,12 @@ cd server
 SQUASH_DIST=../dist/publish ../.venv/bin/uvicorn main:app --host 0.0.0.0 --port 5200
 ```
 
-`curl http://<host>:5200/health` should return `{"status":"ok"}`. The database
+`curl "http://<host>:5200/health"` should return `{"status":"ok"}`. The database
 is created at `server/squash.db`.
+
+Run one uvicorn worker and one control-plane instance. Active device sockets
+and jobs are held in process memory; multiple workers do not share them. Keep
+the SQLite database on persistent storage so device identity and history survive.
 
 **TLS.** The steps above use plain HTTP, which is fine on a private lab network.
 Anywhere else, run uvicorn on `--host 127.0.0.1` and put Caddy in front of it.
@@ -73,6 +79,10 @@ The agent then connects over `wss://` with ordinary certificate validation.
 `squashctl` refuses to send your key over `http://` unless you set
 `SQUASH_ALLOW_PLAINTEXT=1`.
 
+Replace the example hostname with your server's public address. For HTTPS,
+use that `https://` URL in all remaining examples, including the Windows
+installer. Only the server needs inbound access; the Windows agent connects out.
+
 ## 5. Mint an enrollment token
 
 Keep the server running. Open a second terminal in the project root. Replace
@@ -88,7 +98,7 @@ scripts/squashctl install
 This prints a single-use token (valid for one hour) and the exact command to
 run on the endpoint. The command embeds `SQUASH_SERVER`, which is why it must
 be an address the Windows machine can reach. To mint a token without the CLI:
-`curl -X POST -H "X-API-Key: $SQUASH_KEY" $SQUASH_SERVER/api/enrollment-tokens`.
+`curl -X POST -H "X-API-Key: $SQUASH_KEY" "$SQUASH_SERVER/api/enrollment-tokens"`.
 
 ## 6. Install on Windows
 
@@ -119,19 +129,39 @@ scripts/squashctl run "<hostname>" 'Get-Service Spooler | Select Name,Status | C
 
 Or open `http://<host>:5200/` and paste your operator key into the key field.
 
+For curl or Postman, see the [API reference](api.md). Use `GET /api/devices`
+to obtain the device ID, `POST /api/devices/{id}/jobs` to dispatch a script,
+and `GET /api/jobs/{jobId}` to retrieve its result.
+
 ## If enrollment fails
 
 | Symptom | Cause |
 |---|---|
-| `enrolment has not completed within 45s` | The token expired (1 hour), was already used, or the server can't be reached. On the endpoint, check `Get-EventLog -LogName Application -Source SquashRmm.Agent -Newest 5` |
-| `Device is already enrolled` (409) | This machine enrolled before and its key is gone. Uninstall it, then run `squashctl reinstall <host>` to get a recovery token for that one device |
-| `Device is revoked` (403) | Run `squashctl restore <host>` first |
+| `enrolment has not completed within 45s` | The token expired (1 hour), was already used, or the server can't be reached. On the endpoint, inspect Windows Event Viewer → Application for agent/service errors and check `Get-Service SquashEndpoint` |
+| `Device is already enrolled` (409) | This machine enrolled before and its key is gone. From the project root, run `scripts/squashctl reinstall "<hostname>"` to get a recovery token for that device, then run the printed installer command on Windows |
+| `Device is revoked` (403) | Run `scripts/squashctl restore "<hostname>"` first |
 | `iwr` can't connect, or times out | The Windows machine can't reach the control plane. Check that port 5200 (or 443 behind Caddy) accepts inbound connections: the host firewall, and the security group if it's a cloud VM |
 | Device offline right after install | Check that outbound TCP from the endpoint to the control plane's port is allowed |
 
-To remove the agent, run `uninstall.ps1` from the same place. It deletes the
-service, the files and the key. The server keeps the device record and its audit
-history.
+## Upgrade or uninstall
+
+Publish a new agent binary and checksum using step 3, then run
+`scripts/squashctl upgrade "<hostname>"` from the project root to reinstall
+that build remotely. It preserves the device key and identity. A successful
+scheduling response is not proof the upgrade finished; wait for reconnection
+and check `agentVersion`.
+
+To uninstall, run in Administrator PowerShell on Windows, replacing the server
+address with the one used for installation:
+
+```powershell
+$Server = "http://<host>:5200"
+Invoke-WebRequest "$Server/uninstall.ps1" -OutFile uninstall.ps1
+.\uninstall.ps1
+```
+
+This removes the service, files, and device key. The server keeps the device
+record and audit history. A later reinstall needs a device-bound recovery token.
 
 ## Tests
 
@@ -150,10 +180,13 @@ use bash off Windows.
 
 ## Running the AI driver
 
-There are two ways to run an investigation:
+Investigations are available through the dashboard, API, and CLI:
 
 - **Dashboard.** Go to Investigations → New. You'll see progress, evidence and a
   proposed repair, and you approve or reject the repair there.
+- **API.** `POST /api/investigations`, followed by GET requests for progress
+  and a POST to `/api/investigations/{id}/decision` for approval or rejection.
+  See the [request examples](api.md#6-ai-diagnostics-investigations).
 - **CLI.** Prints the timing of each step as it runs:
 
   ```bash
@@ -170,3 +203,17 @@ AWS CLI with SSM access):
   something real out of band. `firewall` is the multi-step network demo: the
   AI can choose network diagnostics to locate the blocking rule.
 - `driver/evals.py <hostname> [repeats]` scores the driver against known faults.
+
+These evals deliberately change a test endpoint through AWS SSM. Set
+`SQUASH_EVAL_INSTANCE` and `AWS_REGION` to that endpoint's EC2 instance and region,
+and use its matching hostname. They are run manually during development, not
+after every command; approved repairs have their own live verification check.
+
+## Submission contents
+
+Include the source archive, the demo video, and the five documents linked from
+the README: this setup guide, API reference, design notes, threat model, and
+build notes. Keep `.git` in the source archive as requested by the assignment.
+Exclude local secrets (`.env`, private keys), runtime databases, `.venv`, and
+generated build outputs. Include `.env.example` so a reviewer can configure
+their own credentials and build the agent from source.

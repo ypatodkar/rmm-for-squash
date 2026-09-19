@@ -1,84 +1,103 @@
-# System Architecture & Design Notes
+# System architecture and design notes
 
-The core philosophy of this system is **security and strict rules**. The software installed on the computers (the agent) is "dumb" by design—it doesn't make decisions; it just proves who it is, runs what it's told, and signs the results.
+The system has a C# Windows service, a Python/FastAPI control plane, and a Python
+AI driver. SQLite stores device identity, job history, inventory, investigations,
+proposals, and decisions. The dashboard, curl, Postman, and AI driver use the
+same REST API. The endpoint executes commands; it does not run an LLM.
 
-All the smart decisions are made by the main server (the control plane) and the AI. Most importantly, **safety rules are hardcoded into the system, not left up to the AI to figure out.**
+## Connection and identity
 
-## 1. How Devices Connect and Identify Themselves
+The Windows service runs as LocalSystem, starts automatically, and opens an
+outbound WebSocket. This works behind NAT without an inbound endpoint port.
+Public deployments use HTTPS/WSS with normal certificate validation. Heartbeats
+arrive every 10 seconds; reachability requires an open, non-revoked connection
+and a received message within 30 seconds.
 
-**The Connection Model**
+Enrollment uses a random, single-use token that expires after one hour. The
+agent generates a P-256 key pair and registers its **public** key. Its private
+key stays on Windows, protected by machine-scope DPAPI and file permissions
+restricted to SYSTEM and Administrators. Every connection requires signing a
+fresh server challenge. The MachineGuid-derived device ID survives reinstall,
+but is not proof of identity. Replacing a lost key requires a recovery token
+bound to that device.
 
-* **Outbound connection:** The agent always connects *out* to the server using WebSockets, so the endpoint needs no inbound network port.
+A stolen unused token can still enroll the first machine that redeems it. This
+remaining gap and the proposed pending-enrollment check are described in the
+[threat model](threat-model.md).
 
-* **Prove who you are:** Every time a device connects, the server gives it a random challenge. The device must sign this challenge with its private key, so knowing or copying a device ID is not enough to impersonate it.
+## Job lifecycle and speed
 
-* **Are you actually there?** An open network connection doesn't mean a computer is awake. The system only considers a device "online" if it has sent a "heartbeat" ping in the last 30 seconds.
+A request validates authentication, enrollment, revocation and reachability,
+stores the job, and returns a job ID without waiting for execution. The server
+pushes it over the existing socket. Individual jobs, rather than persistent
+PowerShell sessions, keep results and audit records isolated while the open
+connection avoids polling delays. PowerShell startup and the command itself
+still contribute latency; roughly two seconds per dependent step is a target,
+not a guarantee for every diagnostic.
 
-* **Smart Reboot Detection:** The system doesn't guess if a computer restarted. It checks the computer's internal ticking clock (uptime). If the clock went backwards, or didn't advance enough, it knows a reboot happened.
+Jobs progress through `Dispatched`, `Running`, and a terminal state:
+`Completed`, `TimedOut`, `Failed`, or `Unreachable`. `Completed` must be checked
+alongside `exitCode`. Output is bounded per stream and truncation is flagged.
+`durationMs` measures endpoint execution; `roundTripMs` measures server dispatch
+to result, excluding client latency and model reasoning.
 
-* **Instant Kicks (Revocation):** If you revoke a device, the system immediately drops its connection, cancels its pending jobs, and locks it out.
+Offline dispatches fail immediately with HTTP 409. An idempotency key makes a
+retry return the original job; conflicting reuse is rejected. The agent checks
+the script hash before execution, and signs the job ID, script hash, exit code,
+duration, and output hashes. The server verifies the result before accepting it.
+Revocation closes the socket, discards undispatched work, and marks outstanding
+jobs unreachable; it cannot undo work already executed.
 
-**Device Identity**
+## AI investigation and durable state
 
-* **IDs vs. keys:** A device ID is derived from Windows `MachineGuid`, but the ID alone is not proof of identity. The agent generates a P-256 private key, protects it with Windows DPAPI in machine scope, and stores it in a directory restricted to SYSTEM and Administrators. The agent proves possession of that key on every connection.
+A problem submission creates a SQLite investigation in `queued` state and
+schedules an in-process asyncio task. An atomic database update claims it as
+`investigating`; blocking model and API calls run in a worker thread. SQLite is
+the durable state store, not a separate polling queue or message broker.
 
-* **Tokens are temporary:** Enrolment tokens are one-time use and expire in an hour. They are just used to introduce the device to the server so it can register its secret key.
+The diagnosis agent chooses from eleven reviewed read-only diagnostics, using
+each result to decide what to check next. Progress is recorded as events and
+collected evidence is saved after diagnosis. The same worker passes the finding
+and evidence directly to a separate planner model call. The planner selects one
+of four reviewed repairs, or explains why no action applies; it does not consume
+a second queue. The operator jobs API still accepts arbitrary PowerShell.
 
-![Agent Enrollment Pipeline](./images/enrollment.png)
-*This diagram shows the exact flow of how an agent uses a temporary token to securely register and open a continuous, authenticated connection.*
+Code limits diagnostic attempts, repeated checks, errors, output and elapsed
+time. The five-minute budget is checked between calls; an in-flight call can
+extend it. Endpoint and user text is treated as untrusted data. Catalogue limits,
+validated arguments and approval enforce the action boundary.
 
-## 2. How Scripts (Jobs) Run
+A proposed repair waits for a human decision. Approval binds the device,
+proposal, rebuilt script and 15-minute expiry. The executor validates that
+binding, rechecks the current condition, dispatches the repair through the job
+API, and runs a verification diagnostic. These checks use ordinary code; the
+model does not authorize or declare its own repair successful.
 
-When you send a script to a computer, it goes through a strict lifecycle: `Dispatched ➔ Running ➔ Completed` (or `TimedOut` / `Failed` / `Unreachable`).
+At server startup, interrupted read-only investigations can restart, pending
+human decisions remain pending, and approved work resumes with its original
+repair idempotency key. Unfinished raw jobs are marked failed instead of being
+blindly rerun. Device connections and active-job coordination are process-local:
+this version must run as one control-plane instance with one uvicorn worker.
 
-* **One Door In:** Every single command goes through one master checkpoint function. This ensures no request can skip security checks.
+## Inventory and operations
 
-* **No Waiting in Line:** If a device is offline, the system immediately rejects the job (Error 409). It does not queue it up to run later. This prevents an AI from accidentally running a fix hours later when the computer's situation has completely changed.
+Inventory is collected on connection when stale, after a detected reboot, and
+periodically while online. GET requests return the stored snapshot. Event-log
+queries run live with validated filters; their output remains in job history.
+Restart records track offline/return transitions, uptime-based boot confirmation,
+and pending-reboot indicators before and after restart. Remote upgrades preserve
+the device key; uninstall removes local files and credentials while retaining
+server history.
 
-* **Double-run protection:** When a caller supplies an idempotency key, repeating the same request returns the original job instead of running the script twice. Reusing the key for a different request is rejected.
+## Next steps
 
-* **Devices Sign Their Homework:** When a computer finishes running a script, it creates a secure summary of exactly what it ran and what the result was, and signs it with its secret key. If the server sees the signature is wrong, or the script was altered, it rejects the result.
+- Bind first enrollment to an independently verified device-key fingerprint.
+- Coordinate sockets and work across instances, with a shared broker and Postgres.
+- Add scoped operator roles and device groups.
+- Sign releases and dispatched jobs with keys protected separately from the server.
+- Send audit records to external storage with tamper-evident chaining.
+- Expand the diagnostic and repair catalogues through review and testing.
 
-## 3. The AI Layer (Smart but Fenced In)
-
-The AI driver acts just like a human operator using the API. It has its own API key, and every move it makes is logged.
-
-**High-Level Investigation Flow**
-
-![Investigation Approval Flow](./images/investigation.png)
-*As seen here, the AI is split into two parts: one that reads data (Diagnosis), and one that plans a fix (Remediation). A human always sits in the middle before any fix is applied.*
-
-**Strict AI Rules**
-
-* **Menus, not blank canvases:** The investigation and remediation agents cannot write PowerShell. They can only choose from a reviewed menu of eleven read-only diagnostics (six for system health, five for network connectivity) and four repairs. The separate operator jobs API still supports arbitrary PowerShell, as required for remote management.
-
-* **Quarantined text:** Device output and user text are clearly labelled as untrusted and wrapped in randomized delimiters before a model sees them. This makes prompt injection harder; the catalogues, fixed device, execution budgets and human approval enforce the actual action boundary.
-
-* **Strict Budgets:** The AI is not allowed to think forever. If it runs 12 checks, hits 6 errors, or takes longer than 5 minutes, it gives up. "I don't have enough evidence" is a perfectly acceptable answer.
-
-**The Approval Gate**
-
-![AI-Driven Repair Proposal Detail](./images/api_flow.png)
-*This detailed diagram outlines the background loops and the strict validation that happens when a fix is proposed and approved.*
-
-* When you approve an AI's proposed fix, you are approving a specific action on a specific machine at that specific moment.
-
-* **Trust, but Verify:** When you click "Approve," the server completely rebuilds the script from scratch based on the menu to ensure the AI didn't sneak anything into the text.
-
-* **Last-second Check:** Right before the repair runs, the server checks the computer *again* to make sure the problem still exists. If things changed while you were deciding, it cancels the repair.
-
-## 4. Future Roadmap
-
-Here is what is planned for future updates:
-
-1. **Scaling:** Move from SQLite to Postgres so multiple control-plane instances can coordinate safely.
-
-2. **Double Signatures:** Having the server digitally sign the jobs it sends, so the agent can verify the server wasn't hacked.
-
-3. **Permissions:** Creating specific roles (like Read-Only or AI-Only) assigned to specific groups of computers.
-
-4. **Queued Jobs:** Adding an optional feature to let safe maintenance jobs wait in line for offline computers.
-
-5. **Tamper-Proof Logs:** Cryptographically chaining the audit logs so hackers can't erase their tracks.
-
-6. **Broader catalogue:** Use investigation history to identify useful new diagnostics and repairs, then require review and testing before adding them to the catalogue.
+Supporting diagrams: [enrollment](images/enrollment.png),
+[investigation](images/investigation.png), and [API/approval flow](images/api_flow.png).
+These illustrate the main paths; the API reference documents error and no-action outcomes.
