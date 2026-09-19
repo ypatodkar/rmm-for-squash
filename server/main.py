@@ -578,6 +578,13 @@ async def agent_connect(websocket: WebSocket) -> None:
     )
     store.touch_device(device_id)
     store.audit("device", "connect.success", device_id=device_id)
+    # Only now, after the signature check, may a device's own report update
+    # its record -- and only its own record.
+    changed = store.update_device_details(device_id, connection.hostname,
+                                          connection.os_version, connection.agent_version)
+    if changed:
+        store.record_device_event(device_id, "details_changed", changed)
+        store.audit("device", "device.details_changed", device_id=device_id, detail=changed)
     record_connection(device, hello)
     log.info("device %s (%s) authenticated", device_id, connection.hostname)
 

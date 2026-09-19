@@ -363,6 +363,28 @@ class Store:
                 (device_id,))
             self._db.commit()
 
+    def update_device_details(self, device_id: str, hostname: str, os_version: str,
+                              agent_version: str) -> dict:
+        """Records what an authenticated device reports about itself on each
+        connection, and returns the fields that changed as {field: [old, new]}.
+        Enrolment used to be the only time these were written, so an upgraded
+        or renamed machine kept showing what it was when it first enrolled."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT hostname, os_version, agent_version FROM devices WHERE device_id = ?",
+                (device_id,)).fetchone()
+            if row is None:
+                return {}
+            new = {"hostname": hostname, "os_version": os_version,
+                   "agent_version": agent_version}
+            changed = {k: [row[k], v] for k, v in new.items() if row[k] != v}
+            if changed:
+                self._db.execute(
+                    "UPDATE devices SET hostname = ?, os_version = ?, agent_version = ?"
+                    " WHERE device_id = ?", (hostname, os_version, agent_version, device_id))
+                self._db.commit()
+            return changed
+
     def touch_device(self, device_id: str) -> None:
         with self._lock:
             self._db.execute(

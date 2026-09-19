@@ -180,3 +180,31 @@ class UptimeReportingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeviceDetailsTests(unittest.TestCase):
+    """A device reports its hostname, OS and agent version on every connection.
+    Enrolment used to be the only time they were stored, so an in-place
+    upgrade never showed up."""
+
+    def setUp(self):
+        from store import Store
+        self.store = Store(":memory:")
+        self.addCleanup(self.store._db.close)
+        self.store.insert_device("dev", "key", "HOST-1", "Windows Server 2022", "0.2.0")
+
+    def test_an_upgrade_is_recorded_with_what_changed(self):
+        changed = self.store.update_device_details("dev", "HOST-1", "Windows Server 2022", "0.3.0")
+        self.assertEqual(changed, {"agent_version": ["0.2.0", "0.3.0"]})
+        self.assertEqual(self.store.get_device("dev")["agent_version"], "0.3.0")
+
+    def test_an_unchanged_report_changes_nothing(self):
+        self.assertEqual(
+            self.store.update_device_details("dev", "HOST-1", "Windows Server 2022", "0.2.0"), {})
+
+    def test_a_rename_is_recorded(self):
+        changed = self.store.update_device_details("dev", "HOST-2", "Windows Server 2022", "0.2.0")
+        self.assertEqual(changed, {"hostname": ["HOST-1", "HOST-2"]})
+
+    def test_an_unknown_device_is_ignored(self):
+        self.assertEqual(self.store.update_device_details("nope", "H", "W", "1"), {})

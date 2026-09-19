@@ -55,8 +55,8 @@ cp "$WORK/build/SquashRmm.Agent.exe" "$WORK/installer/install.ps1" "$WORK/instal
    "$WORK/release/dist/"
 (cd "$WORK/release/dist" && shasum -a 256 SquashRmm.Agent.exe | cut -d' ' -f1 > SquashRmm.Agent.exe.sha256)
 AGENT_SHA=$(cat "$WORK/release/dist/SquashRmm.Agent.exe.sha256")
-# COPYFILE_DISABLE keeps macOS metadata files (._*) out of the bundle.
-COPYFILE_DISABLE=1 tar -czf "$WORK/release.tgz" -C "$WORK/release" server driver dist
+# Keep macOS metadata (._* files, extended attributes) out of the bundle.
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf "$WORK/release.tgz" -C "$WORK/release" server driver dist
 echo "agent sha256 ${AGENT_SHA:0:16}…, bundle $(du -h "$WORK/release.tgz" | cut -f1)"
 
 say "Uploading"
