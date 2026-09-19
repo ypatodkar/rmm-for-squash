@@ -44,15 +44,27 @@ say "Running tests"
   | grep -q '^OK' || die "driver tests failed"
 echo "server and driver tests pass"
 
-say "Building the Windows agent"
-dotnet publish "$WORK/src/SquashRmm.Agent" -c Release -r win-x64 --self-contained \
-  -p:PublishSingleFile=true -o "$WORK/build" >/dev/null || die "agent build failed"
+# .NET builds are not byte-for-byte reproducible, so rebuilding unchanged
+# agent source would publish a "new" binary that no installed agent matches.
+# Builds are kept in S3 under an id derived from the agent's source; while
+# src/ and installer/ are unchanged, the exact binary built before is reused.
+say "Windows agent"
+mkdir -p "$WORK/release/dist"
+AGENT_ID=$( (git rev-parse "HEAD:src"; git rev-parse "HEAD:installer") | shasum -a 256 | cut -c1-16)
+AGENT_S3="s3://$BUCKET/agents/$AGENT_ID/SquashRmm.Agent.exe"
+if aws s3 cp --quiet "$AGENT_S3" "$WORK/release/dist/SquashRmm.Agent.exe" --region "$REGION" 2>/dev/null; then
+  echo "agent source unchanged (build $AGENT_ID); reusing that exact binary"
+else
+  dotnet publish "$WORK/src/SquashRmm.Agent" -c Release -r win-x64 --self-contained \
+    -p:PublishSingleFile=true -o "$WORK/build" >/dev/null || die "agent build failed"
+  cp "$WORK/build/SquashRmm.Agent.exe" "$WORK/release/dist/"
+  aws s3 cp --quiet "$WORK/release/dist/SquashRmm.Agent.exe" "$AGENT_S3" --region "$REGION"
+  echo "built agent $AGENT_ID"
+fi
 
 say "Packaging"
-mkdir -p "$WORK/release/dist"
 cp -R "$WORK/server" "$WORK/driver" "$WORK/release/"
-cp "$WORK/build/SquashRmm.Agent.exe" "$WORK/installer/install.ps1" "$WORK/installer/uninstall.ps1" \
-   "$WORK/release/dist/"
+cp "$WORK/installer/install.ps1" "$WORK/installer/uninstall.ps1" "$WORK/release/dist/"
 (cd "$WORK/release/dist" && shasum -a 256 SquashRmm.Agent.exe | cut -d' ' -f1 > SquashRmm.Agent.exe.sha256)
 AGENT_SHA=$(cat "$WORK/release/dist/SquashRmm.Agent.exe.sha256")
 # Keep macOS metadata (._* files, extended attributes) out of the bundle.

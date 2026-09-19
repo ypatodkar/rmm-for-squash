@@ -80,6 +80,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at DESC);
 
+CREATE TABLE IF NOT EXISTS device_inventory (
+    device_id     TEXT PRIMARY KEY,
+    data          TEXT,    -- JSON from the last successful collection
+    collected_at  REAL,    -- when that collection finished
+    job_id        TEXT,    -- the job that produced it
+    attempted_at  REAL,    -- the last attempt, successful or not
+    error         TEXT     -- why the last attempt failed; NULL if it succeeded
+);
+
 CREATE TABLE IF NOT EXISTS investigations (
     investigation_id TEXT PRIMARY KEY,
     device_id        TEXT NOT NULL,
@@ -384,6 +393,43 @@ class Store:
                     " WHERE device_id = ?", (hostname, os_version, agent_version, device_id))
                 self._db.commit()
             return changed
+
+    # ---------- inventory ----------
+
+    def get_inventory(self, device_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM device_inventory WHERE device_id = ?", (device_id,)).fetchone()
+        return dict(row) if row else None
+
+    def all_inventory(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM device_inventory").fetchall()
+        return {r["device_id"]: dict(r) for r in rows}
+
+    def record_inventory(self, device_id: str, *, attempted_at: float,
+                         data: dict | None = None, job_id: str | None = None,
+                         error: str | None = None) -> None:
+        """A success replaces the stored inventory. A failure records why, and
+        keeps the last good inventory: one bad attempt must not erase what is
+        known about a machine."""
+        with self._lock:
+            if data is not None:
+                self._db.execute(
+                    "INSERT INTO device_inventory (device_id, data, collected_at, job_id,"
+                    " attempted_at, error) VALUES (?,?,?,?,?,NULL)"
+                    " ON CONFLICT(device_id) DO UPDATE SET data=excluded.data,"
+                    " collected_at=excluded.collected_at, job_id=excluded.job_id,"
+                    " attempted_at=excluded.attempted_at, error=NULL",
+                    (device_id, json.dumps(data), attempted_at, job_id, attempted_at))
+            else:
+                self._db.execute(
+                    "INSERT INTO device_inventory (device_id, attempted_at, error, job_id)"
+                    " VALUES (?,?,?,?)"
+                    " ON CONFLICT(device_id) DO UPDATE SET attempted_at=excluded.attempted_at,"
+                    " error=excluded.error",
+                    (device_id, attempted_at, error, job_id))
+            self._db.commit()
 
     def touch_device(self, device_id: str) -> None:
         with self._lock:

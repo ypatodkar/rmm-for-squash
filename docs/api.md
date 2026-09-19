@@ -184,6 +184,90 @@ From the CLI, which also waits for the agent to come back:
 squashctl upgrade WIN-DEMO-1
 ```
 
+### Device inventory
+What each machine is: OS version and build, hardware, installed software and last boot time. The server collects it itself, so reading it never runs anything on the machine:
+- when a device connects and hasn't been collected in the last 6 hours
+- straight away after a reboot
+- every 6 hours while it's online
+- whenever you ask for a refresh.
+
+**Every device:**
+
+```bash
+curl -s $HOST/api/inventory -H "X-API-Key: $KEY"
+
+# Leave out the software lists (each still includes softwareCount)
+curl -s "$HOST/api/inventory?includeSoftware=false" -H "X-API-Key: $KEY"
+```
+
+**One device:**
+
+```bash
+curl -s $HOST/api/devices/$DEVICE/inventory -H "X-API-Key: $KEY"
+```
+
+```json
+{
+  "deviceId": "c61f63b9…",
+  "hostname": "EC2AMAZ-LP5BJ78",
+  "online": true,
+  "revoked": false,
+  "lastBootAt": 1758167003.5,
+  "collectedAt": 1758242130.2,
+  "stale": false,
+  "collecting": false,
+  "lastAttemptAt": 1758242130.2,
+  "lastError": null,
+  "inventory": {
+    "os": {
+      "name": "Microsoft Windows Server 2022 Datacenter",
+      "version": "10.0.20348", "build": "20348.5622", "displayVersion": "21H2",
+      "architecture": "64-bit",
+      "installedAt": "2026-09-17T08:00:22Z", "lastBootAt": "2026-09-18T03:43:23Z"
+    },
+    "hardware": {
+      "manufacturer": "Amazon EC2", "model": "t3.medium",
+      "serialNumber": "ec24eff6-…", "biosVersion": "1.0", "memoryMB": 4036,
+      "processors": [{ "name": "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
+                       "cores": 1, "logicalProcessors": 2, "maxClockMHz": 2500 }],
+      "disks": [{ "drive": "C:", "sizeGB": 50, "freeGB": 29.7 }],
+      "networkAdapters": [{ "name": "Amazon Elastic Network Adapter",
+                            "mac": "0A:FF:C8:B4:EF:43", "ipv4": ["172.31.27.210"] }]
+    },
+    "software": [
+      { "name": "Amazon SSM Agent", "version": "3.3.5226.0",
+        "publisher": "Amazon Web Services", "installedOn": null }
+    ],
+    "softwareCount": 6
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `lastBootAt` (top level) | **Live.** Worked out from the uptime the agent reports every time it connects, so it's current even between collections |
+| `collectedAt` | When the stored inventory was collected |
+| `stale` | `true` if it's older than 6 hours, or has never been collected |
+| `collecting` | A collection is running right now |
+| `lastError` | Why the most recent attempt failed. **The last good inventory is kept**: one failed attempt never erases it |
+| `inventory` | `null` until the first collection succeeds |
+
+A device that hasn't been collected yet is still listed, with `"inventory": null`.
+
+**Collect now:**
+
+```bash
+curl -sX POST $HOST/api/devices/$DEVICE/inventory/refresh -H "X-API-Key: $KEY"
+```
+
+```json
+{ "deviceId": "c61f63b9…", "collecting": true, "jobId": "…" }
+```
+
+`202`: collection has started. It usually takes about 3 seconds; read the result back with `GET`, where `collectedAt` changes. If one is already running you get `"jobId": null` and nothing new is sent. Same checks as any job: `404` if the device isn't enrolled, `403` if revoked, `409` if offline.
+
+**How it's collected.** A fixed, read-only script, sent by the server as an ordinary job under the name `system`. It's signed and time-limited like every other job, and it appears in the job history and audit log (`inventory.collect`). Nothing you send can change the script. Installed software is read from the registry, not from `Win32_Product`, which is slow and makes Windows re-check every installed MSI program. A result that was cut off, or isn't valid JSON, is recorded as a failed collection, never stored as a partial inventory.
+
 ---
 
 ## 4. Restarting a Device

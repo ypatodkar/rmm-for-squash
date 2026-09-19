@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import json
 import logging
 import math
 import os
@@ -16,6 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 import auth
+import inventory
 import protocol
 from jobs import JobStore
 from protocol import JobState, hello_ack, job_dispatch
@@ -123,15 +125,17 @@ async def lifespan(_: FastAPI):
     if not OPERATOR_KEYS:
         log.warning("No operator keys configured; the REST API will reject every request.")
     task = asyncio.create_task(supervise())
+    refresher = asyncio.create_task(refresh_inventories())
     recovered = investigations.recover()
     if recovered:
         log.warning("resumed %d interrupted investigation task(s)", len(recovered))
     try:
         yield
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for background in (task, refresher):
+            background.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await background
 
 
 app = FastAPI(title="Squash RMM Control Plane", lifespan=lifespan)
@@ -510,6 +514,136 @@ async def upgrade_device(device_id: str, request: UpgradeRequest | None = None,
     return {**result, "startsInSeconds": protocol.UPGRADE_DELAY_SECONDS}
 
 
+# ---------- inventory ----------
+# See inventory.py. Collection is an ordinary job sent by the control plane
+# itself, so it is signed, bounded and audited like any other; what callers get
+# from the API is the stored result, without running anything.
+
+INVENTORY_TICK_SECONDS = 60.0
+_inventory_in_flight: set[str] = set()
+_background: set[asyncio.Task] = set()
+
+
+def _spawn(coroutine) -> None:
+    """Runs work in the background, keeping a reference so it is not
+    collected before it finishes."""
+    task = asyncio.create_task(coroutine)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def start_inventory(device_id: str) -> dict:
+    """Sends the collection now and finishes it in the background. Raises the
+    same HTTP errors as any dispatch: unknown, revoked, unreachable."""
+    _inventory_in_flight.add(device_id)
+    try:
+        dispatched = await send_to_device(
+            device_id, inventory.SCRIPT,
+            timeout_seconds=inventory.TIMEOUT_SECONDS,
+            max_output_bytes=inventory.MAX_OUTPUT_BYTES,
+            operator="system", idempotency_key=None,
+            action="inventory.collect", detail={})
+    except BaseException:
+        _inventory_in_flight.discard(device_id)
+        raise
+    _spawn(_finish_inventory(device_id, jobs.get(dispatched["jobId"])))
+    return dispatched
+
+
+async def _finish_inventory(device_id: str, job) -> None:
+    try:
+        if job is not None and not job.state.is_terminal:
+            # The supervisor guarantees a terminal state; this only bounds the wait.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(job.completion),
+                                       timeout=job.timeout_seconds + 30)
+        view = jobs.view(job.job_id) if job is not None else None
+        data, error = inventory.parse(view or {})
+        store.record_inventory(device_id, attempted_at=time.time(), data=data,
+                               job_id=job.job_id if job is not None else None, error=error)
+        if error:
+            log.warning("inventory for %s not collected: %s", device_id, error)
+    finally:
+        _inventory_in_flight.discard(device_id)
+
+
+async def refresh_inventory_if_due(device_id: str, *, force: bool = False) -> None:
+    if device_id in _inventory_in_flight:
+        return
+    if not force and not inventory.due(store.get_inventory(device_id), time.time()):
+        return
+    try:
+        await start_inventory(device_id)
+    except HTTPException as error:
+        log.info("inventory for %s not started: %s", device_id, error.detail)
+
+
+async def refresh_inventories() -> None:
+    """Keeps every reachable device's inventory within MAX_AGE_SECONDS."""
+    while True:
+        await asyncio.sleep(INVENTORY_TICK_SECONDS)
+        for device in store.list_devices():
+            connection = registry.get(device["device_id"])
+            if not device["revoked"] and connection is not None and connection.is_reachable:
+                await refresh_inventory_if_due(device["device_id"])
+
+
+def inventory_view(device: dict, record: dict | None, *, include_software: bool = True) -> dict:
+    connection = registry.get(device["device_id"])
+    data = json.loads(record["data"]) if record and record.get("data") else None
+    if data is not None:
+        data["softwareCount"] = len(data.get("software") or [])
+        if not include_software:
+            data.pop("software", None)
+    return {
+        "deviceId": device["device_id"],
+        "hostname": device["hostname"],
+        "online": bool(connection and connection.is_reachable),
+        "revoked": bool(device["revoked"]),
+        # Live: derived from the uptime the agent reports on every connection,
+        # so it is current even between inventory collections.
+        "lastBootAt": device["last_boot_at"],
+        "collectedAt": (record or {}).get("collected_at"),
+        "stale": inventory.stale(record, time.time()),
+        "collecting": device["device_id"] in _inventory_in_flight,
+        "lastAttemptAt": (record or {}).get("attempted_at"),
+        "lastError": (record or {}).get("error"),
+        "inventory": data,
+    }
+
+
+@app.get("/api/inventory")
+async def list_inventory(include_software: bool = Query(default=True, alias="includeSoftware"),
+                         operator: str = Depends(require_operator)) -> list[dict]:
+    """Every enrolled device with its current inventory. Devices not yet
+    collected are listed with "inventory": null."""
+    records = store.all_inventory()
+    return [inventory_view(d, records.get(d["device_id"]), include_software=include_software)
+            for d in store.list_devices()]
+
+
+@app.get("/api/devices/{device_id}/inventory")
+async def device_inventory(device_id: str,
+                           include_software: bool = Query(default=True, alias="includeSoftware"),
+                           operator: str = Depends(require_operator)) -> dict:
+    device = store.get_device(device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="Unknown device.")
+    return inventory_view(device, store.get_inventory(device_id),
+                          include_software=include_software)
+
+
+@app.post("/api/devices/{device_id}/inventory/refresh", status_code=202)
+async def refresh_inventory(device_id: str, operator: str = Depends(require_operator)) -> dict:
+    """Collects now rather than at the next interval. The result replaces the
+    stored inventory when the job finishes; read it back with GET."""
+    store.audit(operator, "inventory.refresh_requested", device_id=device_id)
+    if device_id in _inventory_in_flight:
+        return {"deviceId": device_id, "collecting": True, "jobId": None}
+    dispatched = await start_inventory(device_id)
+    return {"deviceId": device_id, "collecting": True, "jobId": dispatched["jobId"]}
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str, waitMs: int = 0,
                   operator: str = Depends(require_operator)) -> dict:
@@ -585,7 +719,10 @@ async def agent_connect(websocket: WebSocket) -> None:
     if changed:
         store.record_device_event(device_id, "details_changed", changed)
         store.audit("device", "device.details_changed", device_id=device_id, detail=changed)
-    record_connection(device, hello)
+    rebooted = record_connection(device, hello)
+    # A reboot changes what the inventory says (boot time, often updates), so
+    # it is collected again straight away rather than at the next interval.
+    _spawn(refresh_inventory_if_due(device_id, force=bool(rebooted)))
     log.info("device %s (%s) authenticated", device_id, connection.hostname)
 
     await websocket.send_json(hello_ack(device_id, HEARTBEAT_INTERVAL_SECONDS))
@@ -721,7 +858,7 @@ def elapsed_since_observation(device: dict, monotonic_now: float) -> tuple[float
     return max(0.0, time.time() - observed_at), False
 
 
-def record_connection(device: dict, hello: dict) -> None:
+def record_connection(device: dict, hello: dict) -> bool | None:
     """Records what reconnecting tells us, and no more. A device returning with
     the same boot time means only that no new boot was observed -- it could have
     been a network interruption, an agent restart or a control plane restart.
@@ -754,7 +891,7 @@ def record_connection(device: dict, hello: dict) -> None:
         detail["reason"] = "no comparable previous observation" if uptime is not None \
             else "endpoint did not report uptime"
         store.record_device_event(device_id, "online", detail)
-        return
+        return None
 
     if rebooted:
         store.record_device_event(device_id, "rebooted", detail)
@@ -765,6 +902,7 @@ def record_connection(device: dict, hello: dict) -> None:
     else:
         detail["newBootObserved"] = False
         store.record_device_event(device_id, "online", detail)
+    return rebooted
 
 
 def verify_result(job, payload: dict, device_id: str) -> tuple[bool, str]:
