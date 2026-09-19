@@ -21,7 +21,7 @@ event logs.
 - [API reference](docs/api.md) — endpoints and curl examples
 - [Design](docs/design.md) — architecture and key decisions
 - [Threat model](docs/threat-model.md) — security boundaries and known limitations
-- [How it was built](docs/how-it-was-built.md) — tools, development process, and time
+- [How it was built](docs/how_the_project_was_built.md) — tools, development process, and time
 
 Source: `src/` for the Windows agent, `server/` for the control plane,
 `driver/` for AI, and `installer/` for installation scripts.
