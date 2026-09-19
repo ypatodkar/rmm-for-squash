@@ -3,7 +3,7 @@
 ## AI tools
 
 - **Claude Code with Claude Opus 5** was the main implementation assistant. Of
-  the 41 commits, 40 carry a Claude co-author trailer; the exception is a
+  the 43 commits, 42 carry a Claude co-author trailer; the exception is a
   documentation commit I made myself. It was used across the C# agent, FastAPI
   control plane, Python driver, tests, installers and docs.
 - **Codex** ran alongside Claude Code throughout. I took the same design
@@ -92,6 +92,4 @@ repair instead gets its own live verification diagnostic.
 
 ## Time
 
-The Git history spans about 49 hours, from September 17 to 19, 2026: 41 commits,
-with roughly 16,600 lines added and 2,800 removed. Hands-on time was not tracked separately, so I cannot give a
-more precise estimate without inventing one.
+My hands-on time was about 17–20 hours, across 43 commits.
