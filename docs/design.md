@@ -1,4 +1,4 @@
-# Simplified System Architecture & Design Notes
+# System Architecture & Design Notes
 
 The core philosophy of this system is **security and strict rules**. The software installed on the computers (the agent) is "dumb" by design—it doesn't make decisions; it just proves who it is, runs what it's told, and signs the results.
 
