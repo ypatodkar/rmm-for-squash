@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Deploys the control plane, the AI driver and the Windows agent build to the
+# EC2 control plane, over S3 and SSM (no SSH).
+#
+#   scripts/deploy
+#
+# What is deployed is the committed HEAD, exported with git archive, so an
+# uncommitted edit can never reach production by accident. Tests run first.
+# On the server the current code and database are backed up before anything
+# changes; if the new server does not come up healthy, the backup is put back.
+#
+# Agents are not touched. Afterwards, `squashctl upgrade <host>` moves each one
+# to the build this publishes.
+#
+#   SQUASH_CP_INSTANCE        control plane instance (default below)
+#   SQUASH_ARTIFACTS_BUCKET   S3 bucket for release bundles (default below)
+#   SQUASH_SERVER             public URL, checked after the deploy
+set -euo pipefail
+
+INSTANCE="${SQUASH_CP_INSTANCE:-i-021edb3478131cf00}"
+BUCKET="${SQUASH_ARTIFACTS_BUCKET:-rmm-squash-075521919080-artifacts}"
+REGION="${AWS_REGION:-us-east-1}"
+SERVER="${SQUASH_SERVER:-https://35-173-64-136.sslip.io}"
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+say() { printf '\n==> %s\n' "$1"; }
+
+cd "$ROOT"
+REV=$(git rev-parse --short HEAD)
+[[ -n $(git status --porcelain -- server driver src installer) ]] &&
+  printf 'note: uncommitted changes in server/driver/src/installer are NOT deployed; deploying %s\n' "$REV"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+say "Exporting $REV"
+git archive HEAD | tar -x -C "$WORK"
+
+say "Running tests"
+(cd "$WORK/server" && SQUASH_DB="$WORK/test.db" "$ROOT/.venv/bin/python" -m unittest discover -p 'test_*.py' 2>&1 | tail -1) \
+  | grep -q '^OK' || die "server tests failed"
+(cd "$WORK/driver" && "$ROOT/.venv/bin/python" -m unittest discover -p 'test_*.py' 2>&1 | tail -1) \
+  | grep -q '^OK' || die "driver tests failed"
+echo "server and driver tests pass"
+
+say "Building the Windows agent"
+dotnet publish "$WORK/src/SquashRmm.Agent" -c Release -r win-x64 --self-contained \
+  -p:PublishSingleFile=true -o "$WORK/build" >/dev/null || die "agent build failed"
+
+say "Packaging"
+mkdir -p "$WORK/release/dist"
+cp -R "$WORK/server" "$WORK/driver" "$WORK/release/"
+cp "$WORK/build/SquashRmm.Agent.exe" "$WORK/installer/install.ps1" "$WORK/installer/uninstall.ps1" \
+   "$WORK/release/dist/"
+(cd "$WORK/release/dist" && shasum -a 256 SquashRmm.Agent.exe | cut -d' ' -f1 > SquashRmm.Agent.exe.sha256)
+AGENT_SHA=$(cat "$WORK/release/dist/SquashRmm.Agent.exe.sha256")
+# COPYFILE_DISABLE keeps macOS metadata files (._*) out of the bundle.
+COPYFILE_DISABLE=1 tar -czf "$WORK/release.tgz" -C "$WORK/release" server driver dist
+echo "agent sha256 ${AGENT_SHA:0:16}…, bundle $(du -h "$WORK/release.tgz" | cut -f1)"
+
+say "Uploading"
+KEY_PATH="releases/$REV.tgz"
+aws s3 cp --quiet "$WORK/release.tgz" "s3://$BUCKET/$KEY_PATH" --region "$REGION"
+
+say "Installing on $INSTANCE"
+read -r -d '' REMOTE <<EOF || true
+set -eu
+STAMP=\$(date -u +%Y%m%dT%H%M%SZ)
+BACKUP=/opt/squash-backups/\$STAMP
+STAGE=\$(mktemp -d)
+
+aws s3 cp --quiet s3://$BUCKET/$KEY_PATH \$STAGE/release.tgz --region $REGION
+tar -xzf \$STAGE/release.tgz -C \$STAGE --no-same-owner
+
+# The new code must import before anything is replaced.
+/opt/squash-server/.venv/bin/python -m py_compile \$STAGE/server/*.py \$STAGE/driver/*.py
+(cd \$STAGE/server && /opt/squash-server/.venv/bin/python -c "import sys; sys.path.insert(0, '\$STAGE/driver'); import redaction, fencing, diagnostics, investigator, remediation")
+
+mkdir -p \$BACKUP
+rsync -a --exclude .venv /opt/squash-server/ \$BACKUP/server/
+rsync -a /opt/squash-driver/ \$BACKUP/driver/
+sqlite3 /var/lib/squash/squash.db ".backup '\$BACKUP/squash.db'"
+echo "backup: \$BACKUP"
+
+rollback() {
+  echo "ROLLING BACK to \$BACKUP"
+  rsync -a --delete --exclude .venv \$BACKUP/server/ /opt/squash-server/
+  rsync -a --delete \$BACKUP/driver/ /opt/squash-driver/
+  systemctl restart squash-cp
+}
+
+rsync -a --delete --exclude .venv --exclude dist --exclude __pycache__ \$STAGE/server/ /opt/squash-server/
+rsync -a --delete --exclude __pycache__ \$STAGE/driver/ /opt/squash-driver/
+rsync -a --delete \$STAGE/dist/ /opt/squash-server/dist/
+systemctl restart squash-cp
+
+healthy=0
+for i in \$(seq 1 30); do
+  if curl -sf http://127.0.0.1:5200/health >/dev/null; then healthy=1; break; fi
+  sleep 1
+done
+if [ \$healthy -ne 1 ] || ! curl -sf http://127.0.0.1:5200/openapi.json | grep -q '/upgrade'; then
+  journalctl -u squash-cp -n 20 --no-pager || true
+  rollback
+  exit 1
+fi
+if journalctl -u squash-cp --since "1 minute ago" --no-pager | grep -q "AI driver not available"; then
+  echo "server is up but the AI driver failed to load"
+  rollback
+  exit 1
+fi
+echo "serving agent \$(cat /opt/squash-server/dist/SquashRmm.Agent.exe.sha256 | cut -c1-16)…"
+rm -rf \$STAGE
+echo "deployed $REV"
+EOF
+PARAMS=$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.stdin.read()], "executionTimeout": ["600"]}))' <<<"$REMOTE")
+COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript \
+  --parameters "$PARAMS" --region "$REGION" --query Command.CommandId --output text)
+
+status=""
+for _ in $(seq 1 90); do
+  status=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" \
+    --region "$REGION" --query Status --output text 2>/dev/null || echo "")
+  [[ -n $status && $status != InProgress && $status != Pending ]] && break
+  sleep 3
+done
+aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" --region "$REGION" \
+  --query '[StandardOutputContent,StandardErrorContent]' --output text | sed 's/^/  /'
+[[ $status == Success ]] || die "remote install ended as ${status:-unknown}; see output above"
+
+say "Checking from outside"
+curl -sf "$SERVER/health" >/dev/null || die "$SERVER/health is not answering"
+paths=$(curl -sf "$SERVER/openapi.json" | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin)["paths"])))')
+for route in /api/devices/{device_id}/restart /api/devices/{device_id}/upgrade; do
+  [[ " $paths " == *" $route "* ]] || die "$route missing from the live API"
+done
+[[ $(curl -sf "$SERVER/download/agent.sha256") == "$AGENT_SHA" ]] || die "live agent hash does not match the build"
+echo "live: health ok, restart and upgrade routes present, agent ${AGENT_SHA:0:16}… published"
+printf '\nDeployed %s. Agents reconnect on their own; upgrade them with:\n  scripts/squashctl upgrade <host>\n' "$REV"

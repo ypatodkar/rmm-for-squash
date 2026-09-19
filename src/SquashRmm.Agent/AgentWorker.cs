@@ -11,7 +11,7 @@ public sealed class AgentWorker(
     Enrollment enrollment,
     ILogger<AgentWorker> log) : BackgroundService
 {
-    private const string AgentVersion = "0.2.0";
+    private const string AgentVersion = "0.3.0";
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(30);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
