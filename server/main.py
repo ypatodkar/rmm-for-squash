@@ -20,6 +20,7 @@ import auth
 import eventlog
 import inventory
 import protocol
+import reboots
 from jobs import JobStore
 from protocol import JobState, hello_ack, job_dispatch
 from registry import HEARTBEAT_INTERVAL_SECONDS, DeviceConnection, DeviceRegistry
@@ -127,13 +128,14 @@ async def lifespan(_: FastAPI):
         log.warning("No operator keys configured; the REST API will reject every request.")
     task = asyncio.create_task(supervise())
     refresher = asyncio.create_task(refresh_inventories())
+    restart_watcher = asyncio.create_task(watch_restarts())
     recovered = investigations.recover()
     if recovered:
         log.warning("resumed %d interrupted investigation task(s)", len(recovered))
     try:
         yield
     finally:
-        for background in (task, refresher):
+        for background in (task, refresher, restart_watcher):
             background.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await background
@@ -457,10 +459,10 @@ async def restart_device(device_id: str, request: RestartRequest | None = None,
     expected to know, because it is the one destructive thing in this API and
     it should be legible in the audit log as itself.
 
-    It still becomes an ordinary job: the same dispatch path, the same
-    attested result, the same history. What the route adds is that the caller
-    cannot get the command wrong, and cannot smuggle anything else in beside
-    it -- the only things it supplies are a delay and a message.
+    Each restart is tracked as a record of its own (see reboots.py): before it
+    is sent, the machine is asked whether it was already waiting on a pending
+    reboot; the record then follows it offline and back, and says whether it
+    came back with a new boot. GET /api/restarts/{restartId} reads it.
     """
     request = request or RestartRequest()
     try:
@@ -468,21 +470,189 @@ async def restart_device(device_id: str, request: RestartRequest | None = None,
     except protocol.RestartError as error:
         raise HTTPException(status_code=400, detail=str(error)) from None
 
-    result = await send_to_device(
-        device_id, script,
-        # shutdown.exe schedules the restart and returns at once; it does
-        # not block for the delay, so this is an ordinary short job.
-        timeout_seconds=30, max_output_bytes=4096,
-        operator=operator, idempotency_key=request.idempotency_key,
-        action="device.restart",
-        detail={"delaySeconds": request.delay_seconds, "reason": request.reason})
+    send = dict(timeout_seconds=30, max_output_bytes=4096, operator=operator,
+                idempotency_key=request.idempotency_key, action="device.restart",
+                # shutdown.exe schedules the restart and returns at once; it does
+                # not block for the delay, so this is an ordinary short job.
+                detail={"delaySeconds": request.delay_seconds, "reason": request.reason})
 
-    if not result.get("deduplicated"):
-        store.record_device_event(device_id, "restart_requested",
-                                  {"operator": operator,
-                                   "delaySeconds": request.delay_seconds})
-    return {**result, "restartAt": time.time() + request.delay_seconds,
-            "delaySeconds": request.delay_seconds}
+    if request.idempotency_key and store.job_for_idempotency_key(request.idempotency_key):
+        # A retry: answered by the earlier restart, or 409 if the key was reused
+        # for something else. Nothing is checked or sent again.
+        result = await send_to_device(device_id, script, **send)
+        record = store.restart_for_job(result["jobId"])
+        if record is None:
+            return {**result, "delaySeconds": request.delay_seconds}
+        return {**result, **_restart_response(record)}
+
+    # Asking first also settles 404/403/409 before anything is recorded.
+    pending, pending_error, _ = await check_pending_reboot(device_id, operator)
+
+    restart_id = "rst-" + uuid.uuid4().hex[:20]
+    store.insert_restart({
+        "restart_id": restart_id, "device_id": device_id, "requested_by": operator,
+        "requested_at": time.time(), "delay_seconds": request.delay_seconds,
+        "reason": request.reason, "status": "scheduling",
+        "pending_before": None if pending is None else int(pending["pending"]),
+        "pending_before_reasons": json.dumps(pending["reasons"]) if pending else None,
+        "pending_check_error": pending_error,
+    })
+    try:
+        result = await send_to_device(device_id, script,
+                                      **{**send, "detail": {**send["detail"], "restartId": restart_id}})
+    except HTTPException as error:
+        store.update_restart(restart_id, {"status": "failed",
+                                          "error": f"the restart could not be sent: {error.detail}"})
+        raise
+    store.update_restart(restart_id, {"job_id": result["jobId"]})
+    store.record_device_event(device_id, "restart_requested",
+                              {"operator": operator, "delaySeconds": request.delay_seconds,
+                               "restartId": restart_id})
+    _spawn(_follow_restart_command(restart_id, jobs.get(result["jobId"])))
+    return {**result, **_restart_response(store.get_restart(restart_id))}
+
+
+def _restart_response(record: dict) -> dict:
+    view = restart_view(record)
+    return {"restartId": view["restartId"],
+            "restartAt": record["requested_at"] + (record["delay_seconds"] or 0),
+            "delaySeconds": record["delay_seconds"],
+            "pendingRebootBefore": view["pendingRebootBefore"],
+            "pendingCheckError": view["pendingCheckError"]}
+
+
+# ---------- restart tracking ----------
+
+def restart_view(record: dict) -> dict:
+    def pending(flag, reasons):
+        if flag is None:
+            return None
+        return {"pending": bool(flag), "reasons": json.loads(reasons) if reasons else []}
+    return {
+        "restartId": record["restart_id"],
+        "deviceId": record["device_id"],
+        "status": record["status"],
+        "requestedBy": record["requested_by"],
+        "requestedAt": record["requested_at"],
+        "delaySeconds": record["delay_seconds"],
+        "reason": record["reason"],
+        "jobId": record["job_id"],
+        "pendingRebootBefore": pending(record["pending_before"], record["pending_before_reasons"]),
+        "pendingCheckError": record["pending_check_error"],
+        "scheduledAt": record["scheduled_at"],
+        "wentOfflineAt": record["went_offline_at"],
+        "cameBackAt": record["came_back_at"],
+        "bootConfirmed": None if record["boot_confirmed"] is None else bool(record["boot_confirmed"]),
+        "pendingRebootAfter": pending(record["pending_after"], record["pending_after_reasons"]),
+        "error": record["error"],
+    }
+
+
+async def _dispatch_and_wait(device_id: str, script: str, *, timeout_seconds: int,
+                             max_output_bytes: int, operator: str, action: str,
+                             detail: dict) -> tuple[dict, str]:
+    dispatched = await send_to_device(device_id, script, timeout_seconds=timeout_seconds,
+                                      max_output_bytes=max_output_bytes, operator=operator,
+                                      idempotency_key=None, action=action, detail=detail)
+    job = jobs.get(dispatched["jobId"])
+    if job is not None and not job.state.is_terminal:
+        # The supervisor guarantees a terminal state; this only bounds the wait.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(job.completion), timeout=timeout_seconds + 15)
+    return jobs.view(dispatched["jobId"]) or {}, dispatched["jobId"]
+
+
+async def check_pending_reboot(device_id: str, operator: str) -> tuple[dict | None, str | None, str]:
+    """Asks the machine whether Windows is waiting to restart. Raises the
+    usual dispatch errors; a check that ran but failed is returned as an
+    error, never as "nothing pending"."""
+    view, job_id = await _dispatch_and_wait(
+        device_id, reboots.PENDING_SCRIPT, timeout_seconds=reboots.CHECK_TIMEOUT_SECONDS,
+        max_output_bytes=16384, operator=operator, action="reboot.pending_check", detail={})
+    result, error = reboots.parse_pending(view)
+    return result, error, job_id
+
+
+async def _follow_restart_command(restart_id: str, job) -> None:
+    if job is not None and not job.state.is_terminal:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(job.completion), timeout=job.timeout_seconds + 30)
+    record = store.get_restart(restart_id)
+    view = jobs.view(job.job_id) if job is not None else None
+    if record is not None:
+        store.update_restart(restart_id,
+                             reboots.restart_command_finished(record, view or {}, time.time()))
+
+
+def advance_restarts_on_disconnect(device_id: str) -> None:
+    for record in store.open_restarts(device_id):
+        store.update_restart(record["restart_id"], reboots.went_offline(record, time.time()))
+
+
+def advance_restarts_on_return(device_id: str, rebooted: bool | None) -> None:
+    for record in store.open_restarts(device_id):
+        changes = reboots.came_back(record, rebooted, time.time())
+        store.update_restart(record["restart_id"], changes)
+        if changes.get("status") == "completed":
+            _spawn(_check_pending_after(record["restart_id"], device_id))
+
+
+async def _check_pending_after(restart_id: str, device_id: str) -> None:
+    """Did the restart clear what Windows was waiting for?"""
+    try:
+        pending, error, _ = await check_pending_reboot(device_id, "system")
+    except HTTPException as refused:
+        log.info("pending-reboot check after restart %s not run: %s", restart_id, refused.detail)
+        return
+    if pending is not None:
+        store.update_restart(restart_id, {"pending_after": int(pending["pending"]),
+                                          "pending_after_reasons": json.dumps(pending["reasons"])})
+    else:
+        log.info("pending-reboot check after restart %s failed: %s", restart_id, error)
+
+
+RESTART_WATCH_SECONDS = 30.0
+
+
+async def watch_restarts() -> None:
+    """Closes restarts that will not finish on their own: never went offline,
+    or never came back."""
+    while True:
+        await asyncio.sleep(RESTART_WATCH_SECONDS)
+        now = time.time()
+        for record in store.open_restarts():
+            store.update_restart(record["restart_id"], reboots.overdue(record, now))
+
+
+@app.get("/api/restarts/{restart_id}")
+async def get_restart(restart_id: str, operator: str = Depends(require_operator)) -> dict:
+    record = store.get_restart(restart_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown restart.")
+    return restart_view(record)
+
+
+@app.get("/api/devices/{device_id}/restarts")
+async def list_restarts(device_id: str, limit: int = Query(default=20, ge=1, le=100),
+                        operator: str = Depends(require_operator)) -> list[dict]:
+    if store.get_device(device_id) is None:
+        raise HTTPException(status_code=404, detail="Unknown device.")
+    return [restart_view(r) for r in store.restarts_for_device(device_id, limit)]
+
+
+@app.get("/api/devices/{device_id}/pending-reboot")
+async def pending_reboot(device_id: str, operator: str = Depends(require_operator)) -> dict:
+    """Asks the machine now whether Windows is waiting to restart, and why."""
+    pending, error, job_id = await check_pending_reboot(device_id, operator)
+    if error:
+        state = (jobs.view(job_id) or {}).get("state")
+        no_answer = state in (None, "Queued", "Dispatched", "Running", "TimedOut", "Unreachable")
+        raise HTTPException(status_code=504 if no_answer else 502,
+                            detail=f"The device could not answer the check: {error}")
+    device = store.get_device(device_id) or {}
+    return {"deviceId": device_id, "hostname": device.get("hostname"),
+            "pending": pending["pending"], "reasons": pending["reasons"],
+            "checkedAt": time.time(), "jobId": job_id}
 
 
 @app.post("/api/devices/{device_id}/upgrade", status_code=202)
@@ -779,6 +949,7 @@ async def agent_connect(websocket: WebSocket) -> None:
         store.record_device_event(device_id, "details_changed", changed)
         store.audit("device", "device.details_changed", device_id=device_id, detail=changed)
     rebooted = record_connection(device, hello)
+    advance_restarts_on_return(device_id, rebooted)
     # A reboot changes what the inventory says (boot time, often updates), so
     # it is collected again straight away rather than at the next interval.
     _spawn(refresh_inventory_if_due(device_id, force=bool(rebooted)))
@@ -810,6 +981,7 @@ async def agent_connect(websocket: WebSocket) -> None:
         else:
             store.set_disconnected(device_id)
             store.record_device_event(device_id, "offline", {"reason": "connection closed"})
+            advance_restarts_on_disconnect(device_id)
             store.audit("device", "disconnect", device_id=device_id)
             log.info("device %s disconnected", device_id)
 

@@ -364,6 +364,88 @@ squashctl restart WIN-DEMO-1 --yes              # no prompt, for scripts
 
 Without `--yes` it asks you to type the device name, and refuses outright if there is no terminal to ask at, so a restart cannot happen by accident in a pipeline.
 
+### Tracking a restart
+Each restart is tracked as a record of its own, from the request until the machine is back. The restart response above also includes:
+
+```json
+{
+  "restartId": "rst-3f9a…",
+  "pendingRebootBefore": { "pending": true, "reasons": [
+    { "code": "windows_update", "description": "Windows Update has installed updates that need a restart" } ] },
+  "pendingCheckError": null
+}
+```
+
+Before sending the restart, the server asks the machine whether Windows was **already waiting on a pending reboot**. That's `pendingRebootBefore`. If that check fails, the restart still goes ahead: `pendingRebootBefore` is `null` and `pendingCheckError` says why.
+
+Follow it:
+
+```bash
+curl -s $HOST/api/restarts/rst-3f9a… -H "X-API-Key: $KEY"
+
+# Every restart of one device, newest first (limit 1-100, default 20)
+curl -s "$HOST/api/devices/$DEVICE/restarts?limit=5" -H "X-API-Key: $KEY"
+```
+
+```json
+{
+  "restartId": "rst-3f9a…",
+  "deviceId": "c61f63b9…",
+  "status": "completed",
+  "requestedBy": "operator",
+  "requestedAt": 1758242000.1,
+  "delaySeconds": 15,
+  "reason": "Restart requested from Squash RMM",
+  "jobId": "…",
+  "pendingRebootBefore": { "pending": true, "reasons": [ … ] },
+  "pendingCheckError": null,
+  "scheduledAt": 1758242001.9,
+  "wentOfflineAt": 1758242017.4,
+  "cameBackAt": 1758242071.8,
+  "bootConfirmed": true,
+  "pendingRebootAfter": { "pending": false, "reasons": [] },
+  "error": null
+}
+```
+
+| `status` | Meaning |
+|---|---|
+| `scheduling` | Checking for a pending reboot, then sending the restart |
+| `scheduled` | The machine confirmed the restart is booked (`scheduledAt`) |
+| `offline` | Its connection dropped after the request (`wentOfflineAt`) |
+| `completed` | It's back (`cameBackAt`), and `bootConfirmed: true` means a new boot was seen. `null` means back but unconfirmed, and `error` says so |
+| `not_restarted` | It went offline but came back **without** rebooting, e.g. someone cancelled the shutdown on the machine |
+| `failed` | The restart couldn't be sent or run, the machine never went offline within 10 minutes of its delay, or it didn't come back within 30 minutes. `error` says which |
+
+`bootConfirmed` is the server's own judgement, from the uptime the machine reports when it reconnects. It never relies on the machine simply saying it restarted. A reconnect *before* the machine goes down, such as a network blip during the delay, doesn't count as coming back.
+
+After a `completed` restart the server asks again, so `pendingRebootAfter` shows whether the restart **cleared** what Windows was waiting for.
+
+### Is a reboot pending right now?
+
+```bash
+curl -s $HOST/api/devices/$DEVICE/pending-reboot -H "X-API-Key: $KEY"
+```
+
+```json
+{ "deviceId": "c61f63b9…", "hostname": "EC2AMAZ-LP5BJ78", "pending": true,
+  "reasons": [ { "code": "pending_file_operations",
+                 "description": "1 file operation(s) are scheduled to run at the next restart" } ],
+  "checkedAt": 1758242000.4, "jobId": "…" }
+```
+
+It checks, read-only, every place Windows records that it needs a restart:
+
+| `code` | What Windows is waiting for |
+|---|---|
+| `component_servicing` | A Windows feature or update to finish installing or removing |
+| `windows_update` | Installed updates that need a restart |
+| `pending_file_operations` | Files to be replaced or deleted at the next boot |
+| `update_installer` | An update installer to finish |
+| `computer_rename` | A new computer name to take effect |
+
+The device must be online (`409` otherwise). A check that ran but failed is `502`, never "nothing pending".
+
 ---
 
 ## 5. Running Scripts (Jobs)

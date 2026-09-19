@@ -89,6 +89,29 @@ CREATE TABLE IF NOT EXISTS device_inventory (
     error         TEXT     -- why the last attempt failed; NULL if it succeeded
 );
 
+CREATE TABLE IF NOT EXISTS restarts (
+    restart_id             TEXT PRIMARY KEY,
+    device_id              TEXT NOT NULL,
+    requested_by           TEXT,
+    requested_at           REAL NOT NULL,
+    delay_seconds          INTEGER,
+    reason                 TEXT,
+    job_id                 TEXT,
+    status                 TEXT NOT NULL,
+    pending_before         INTEGER,   -- was Windows already waiting to restart
+    pending_before_reasons TEXT,
+    pending_check_error    TEXT,
+    scheduled_at           REAL,      -- the machine confirmed the restart is booked
+    went_offline_at        REAL,
+    came_back_at           REAL,
+    boot_confirmed         INTEGER,
+    pending_after          INTEGER,   -- still waiting after coming back
+    pending_after_reasons  TEXT,
+    error                  TEXT,
+    updated_at             REAL
+);
+CREATE INDEX IF NOT EXISTS idx_restarts_device ON restarts(device_id, requested_at);
+
 CREATE TABLE IF NOT EXISTS investigations (
     investigation_id TEXT PRIMARY KEY,
     device_id        TEXT NOT NULL,
@@ -393,6 +416,63 @@ class Store:
                     " WHERE device_id = ?", (hostname, os_version, agent_version, device_id))
                 self._db.commit()
             return changed
+
+    # ---------- restarts ----------
+
+    _RESTART_FIELDS = {"job_id", "status", "pending_before", "pending_before_reasons",
+                       "pending_check_error", "scheduled_at", "went_offline_at",
+                       "came_back_at", "boot_confirmed", "pending_after",
+                       "pending_after_reasons", "error"}
+
+    def insert_restart(self, record: dict) -> None:
+        columns = ", ".join(record)
+        with self._lock:
+            self._db.execute(
+                f"INSERT INTO restarts ({columns}, updated_at) VALUES "
+                f"({', '.join('?' * len(record))}, ?)", (*record.values(), time.time()))
+            self._db.commit()
+
+    def update_restart(self, restart_id: str, changes: dict) -> None:
+        unknown = set(changes) - self._RESTART_FIELDS
+        if unknown:
+            raise ValueError(f"not restart fields: {sorted(unknown)}")
+        if not changes:
+            return
+        assignments = ", ".join(f"{name} = ?" for name in changes)
+        with self._lock:
+            self._db.execute(
+                f"UPDATE restarts SET {assignments}, updated_at = ? WHERE restart_id = ?",
+                (*changes.values(), time.time(), restart_id))
+            self._db.commit()
+
+    def get_restart(self, restart_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM restarts WHERE restart_id = ?", (restart_id,)).fetchone()
+        return dict(row) if row else None
+
+    def restart_for_job(self, job_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM restarts WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def restarts_for_device(self, device_id: str, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM restarts WHERE device_id = ? ORDER BY requested_at DESC LIMIT ?",
+                (device_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def open_restarts(self, device_id: str | None = None) -> list[dict]:
+        query = "SELECT * FROM restarts WHERE status IN ('scheduling', 'scheduled', 'offline')"
+        params: tuple = ()
+        if device_id is not None:
+            query += " AND device_id = ?"
+            params = (device_id,)
+        with self._lock:
+            rows = self._db.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------- inventory ----------
 

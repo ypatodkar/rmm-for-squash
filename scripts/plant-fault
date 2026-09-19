@@ -13,6 +13,7 @@
 #   scripts/plant-fault memory            start a process that eats 1.5 GB
 #   scripts/plant-fault dns               point example.com at a dead address (hosts file)
 #   scripts/plant-fault firewall          block one.one.one.one with an outbound rule
+#   scripts/plant-fault pending-reboot    make Windows wait on a restart (a real one; a restart clears it)
 #   scripts/plant-fault reset             put everything back
 #
 #   SQUASH_EVAL_INSTANCE   EC2 instance id of the endpoint (default below)
@@ -53,13 +54,15 @@ SERVICES="Spooler W32Time Themes"
 DNS_TARGET="example.com"
 DNS_MARKER="squash-demo"
 FIREWALL_RULE="SquashDemoBlock"
+PENDING_FILE='C:\Windows\Temp\squash-demo-pending-reboot.txt'
 
 show_status() {
   echo "Endpoint $INSTANCE"
   echo
   run_on_endpoint "Get-Service ${SERVICES// /,} | Select-Object Name,Status,StartType | Format-Table -AutoSize | Out-String;
 'hosts-file demo entries: ' + @(Select-String -Path \$env:SystemRoot\\System32\\drivers\\etc\\hosts -Pattern '$DNS_MARKER' | ForEach-Object { \$_.Line }).Count;
-'demo firewall rule: ' + [bool](Get-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue)"
+'demo firewall rule: ' + [bool](Get-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue);
+'demo pending reboot: ' + [bool](@((Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations) -contains '\\??\\$PENDING_FILE')"
 }
 
 plant() {
@@ -159,7 +162,42 @@ Or from the terminal:
   (cd driver && ../.venv/bin/python diagnose.py <hostname> "This machine can't reach one.one.one.one, but the rest of the internet works.")
 EOF
   ;;
+pending-reboot)
+  # A genuine pending reboot: Windows is told to delete one file of ours at the
+  # next boot. A restart really processes and clears it, unlike a faked
+  # Windows Update key, which would still look pending afterwards.
+  echo "Making $INSTANCE wait on a restart …"
+  run_on_endpoint "\$file = '$PENDING_FILE';
+Set-Content -Path \$file -Value 'Deleted by Windows at the next restart. Planted by the Squash RMM demo.';
+\$key = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager';
+\$existing = (Get-ItemProperty \$key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations;
+\$entry = @(\"\\??\\\$file\", '');
+\$values = if (\$existing) { @(\$existing) + \$entry } else { \$entry };
+New-ItemProperty -Path \$key -Name PendingFileRenameOperations -PropertyType MultiString -Value \$values -Force | Out-Null;
+'planted: ' + \$file + ' will be deleted at the next restart'" | sed 's/^/  /'
+  cat <<'EOF'
+
+Planted: Windows now has a file operation waiting for the next restart, so the
+machine reports a pending reboot.
+
+  GET  /api/devices/{id}/pending-reboot   -> "pending": true
+  POST /api/devices/{id}/restart          -> "pendingRebootBefore": {"pending": true, …}
+  GET  /api/restarts/{restartId}          -> ends "completed", "pendingRebootAfter": {"pending": false}
+EOF
+  ;;
 reset)
+  echo "Removing the pending-reboot plant on $INSTANCE …"
+  run_on_endpoint "\$file = '$PENDING_FILE';
+\$key = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager';
+\$existing = @((Get-ItemProperty \$key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations);
+\$kept = [System.Collections.Generic.List[string]]::new();
+for (\$i = 0; \$i -lt \$existing.Count; \$i += 2) {
+  if (\$existing[\$i] -ne \"\\??\\\$file\") { \$kept.Add(\$existing[\$i]); if (\$i + 1 -lt \$existing.Count) { \$kept.Add(\$existing[\$i + 1]) } }
+};
+if (\$kept.Count -gt 0) { New-ItemProperty -Path \$key -Name PendingFileRenameOperations -PropertyType MultiString -Value \$kept.ToArray() -Force | Out-Null }
+else { Remove-ItemProperty -Path \$key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue };
+Remove-Item \$file -Force -ErrorAction SilentlyContinue;
+'pending-reboot plant removed'" | sed 's/^/  /'
   echo "Removing network faults on $INSTANCE …"
   run_on_endpoint "Remove-NetFirewallRule -Name $FIREWALL_RULE -ErrorAction SilentlyContinue;
 \$hosts = Join-Path \$env:SystemRoot 'System32\\drivers\\etc\\hosts';
@@ -174,7 +212,7 @@ foreach (\$s in '${SERVICES// /','}') { Start-Service \$s -ErrorAction SilentlyC
 Get-Service ${SERVICES// /,} | Select-Object Name,Status | Format-Table -AutoSize | Out-String" | sed 's/^/  /'
   ;;
 *)
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
   ;;
 esac
